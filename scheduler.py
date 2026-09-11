@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sqlite3
 import time
 from typing import Any
@@ -11,7 +12,8 @@ LIDARR_URL = os.environ["LIDARR_URL"].rstrip("/")
 LIDARR_API_KEY = os.environ["LIDARR_API_KEY"]
 SEARCH_INTERVAL_SECONDS = int(os.getenv("SEARCH_INTERVAL_SECONDS", "30"))
 BATCH_SIZE = max(1, int(os.getenv("BATCH_SIZE", "5")))
-MAX_SEARCHES_PER_RUN = max(1, int(os.getenv("MAX_SEARCHES_PER_RUN", "20")))
+MAX_DOWNLOADS_PER_RUN = max(1, int(os.getenv("MAX_DOWNLOADS_PER_RUN", "20")))
+MAX_SEARCHES_PER_RUN = max(1, int(os.getenv("MAX_SEARCHES_PER_RUN", "100")))
 MAX_SEARCHES_PER_DAY = max(1, int(os.getenv("MAX_SEARCHES_PER_DAY", "100")))
 ALBUM_COOLDOWN_HOURS = max(0, float(os.getenv("ALBUM_COOLDOWN_HOURS", "72")))
 MISSING_PAGE_SIZE = max(50, int(os.getenv("MISSING_PAGE_SIZE", "500")))
@@ -207,7 +209,13 @@ class Scheduler:
             )
         self.db.commit()
 
-    def run_search(self, album_ids: list[int]) -> bool:
+    @staticmethod
+    def parse_download_count(result: str) -> int:
+        """Extract Lidarr's report-download count from its command message."""
+        match = re.search(r"(\d+)\s+reports?\s+downloaded", result, re.IGNORECASE)
+        return int(match.group(1)) if match else 0
+
+    def run_search(self, album_ids: list[int]) -> tuple[bool, int]:
         payload = {"name": "AlbumSearch", "albumIds": album_ids}
         data = self.post_json("command", payload)
         command_id = int(data["id"])
@@ -235,12 +243,20 @@ class Scheduler:
                 result = f"command timeout after {COMMAND_TIMEOUT_SECONDS}s"
                 success = False
 
-        self.record_search_result(album_ids, command_id, str(result), success)
+        result = str(result)
+        download_count = self.parse_download_count(result) if success else 0
+        self.record_search_result(album_ids, command_id, result, success)
+
         if success:
-            log.info("Completed AlbumSearch command %s: %s", command_id, result)
+            log.info(
+                "Completed AlbumSearch command %s: %s | downloads initiated: %d",
+                command_id,
+                result,
+                download_count,
+            )
         else:
             log.error("AlbumSearch command %s did not complete successfully: %s", command_id, result)
-        return success
+        return success, download_count
 
     def run_once(self) -> None:
         used_today = self.searches_last_24h()
@@ -267,16 +283,42 @@ class Scheduler:
             return
 
         log.info(
-            "Missing albums: %d | eligible now: %d | rolling 24h searches: %d/%d",
+            "Missing albums: %d | eligible now: %d | target downloads this run: %d | rolling 24h searches: %d/%d",
             total_missing,
             len(candidates),
+            MAX_DOWNLOADS_PER_RUN,
             used_today,
             MAX_SEARCHES_PER_DAY,
         )
 
+        downloads_in_run = 0
+        searches_in_run = 0
+
         for offset in range(0, len(candidates), BATCH_SIZE):
             batch = candidates[offset : offset + BATCH_SIZE]
-            self.run_search(batch)
+            success, download_count = self.run_search(batch)
+            searches_in_run += len(batch)
+            downloads_in_run += download_count
+
+            log.info(
+                "Run progress: downloads=%d/%d searches=%d/%d",
+                downloads_in_run,
+                MAX_DOWNLOADS_PER_RUN,
+                searches_in_run,
+                MAX_SEARCHES_PER_RUN,
+            )
+
+            if downloads_in_run >= MAX_DOWNLOADS_PER_RUN:
+                log.info(
+                    "Download limit reached for this run: %d/%d downloads initiated",
+                    downloads_in_run,
+                    MAX_DOWNLOADS_PER_RUN,
+                )
+                break
+
+            if not success:
+                log.warning("Search batch did not complete successfully; continuing with the next batch")
+
             if offset + BATCH_SIZE < len(candidates):
                 log.info("Waiting %ss before next batch", SEARCH_INTERVAL_SECONDS)
                 time.sleep(SEARCH_INTERVAL_SECONDS)
@@ -285,9 +327,10 @@ class Scheduler:
         log.info("Lidarr Deezer Scheduler starting")
         log.info("Lidarr URL: %s", LIDARR_URL)
         log.info(
-            "Config: interval=%ss batch=%d max/run=%d max/24h=%d cooldown=%sh",
+            "Config: interval=%ss batch=%d max downloads/run=%d max searches/run=%d max searches/24h=%d cooldown=%sh",
             SEARCH_INTERVAL_SECONDS,
             BATCH_SIZE,
+            MAX_DOWNLOADS_PER_RUN,
             MAX_SEARCHES_PER_RUN,
             MAX_SEARCHES_PER_DAY,
             ALBUM_COOLDOWN_HOURS,
