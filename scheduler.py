@@ -1,9 +1,7 @@
 import logging
 import os
-import re
 import sqlite3
 import time
-from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -80,11 +78,21 @@ class Scheduler:
         response.raise_for_status()
         return response.json()
 
-    def fetch_missing_albums(self) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        page = 1
+    def fetch_missing_candidates(self, limit: int) -> tuple[list[int], int]:
+        """Page through missing albums until enough eligible candidates are found.
 
-        while True:
+        We intentionally do not load the entire missing backlog into memory. Lidarr can
+        have tens of thousands of missing albums, so stop paging as soon as this run has
+        enough albums to search. The returned count is the total missing-record count
+        reported by Lidarr, when available.
+        """
+        candidates: list[int] = []
+        seen: set[int] = set()
+        page = 1
+        total = 0
+        records_scanned = 0
+
+        while len(candidates) < limit:
             data = self.get_json(
                 "wanted/missing",
                 params={
@@ -95,23 +103,47 @@ class Scheduler:
                 },
             )
             page_records = data.get("records", [])
-            records.extend(page_records)
+            total = int(data.get("totalRecords", total))
+            records_scanned += len(page_records)
 
-            total = int(data.get("totalRecords", len(records)))
-            if not page_records or len(records) >= total or len(page_records) < MISSING_PAGE_SIZE:
+            if not page_records:
+                break
+
+            for record in page_records:
+                album_id = record.get("id")
+                if album_id is None:
+                    album_id = record.get("albumId")
+                if album_id is None:
+                    continue
+
+                album_id = int(album_id)
+                if album_id in seen:
+                    continue
+                seen.add(album_id)
+
+                if not self.recently_searched(album_id):
+                    candidates.append(album_id)
+                    if len(candidates) >= limit:
+                        break
+
+            log.info(
+                "Missing scan: page=%d records_scanned=%d eligible=%d/%d total_missing=%d",
+                page,
+                records_scanned,
+                len(candidates),
+                limit,
+                total,
+            )
+
+            if len(candidates) >= limit:
+                break
+            if len(page_records) < MISSING_PAGE_SIZE:
+                break
+            if records_scanned >= total:
                 break
             page += 1
 
-        # De-duplicate defensively in case Lidarr returns the same album more than once.
-        unique: dict[int, dict[str, Any]] = {}
-        for record in records:
-            album_id = record.get("id")
-            if album_id is None:
-                album_id = record.get("albumId")
-            if album_id is not None:
-                unique[int(album_id)] = record
-
-        return list(unique.values())
+        return candidates, total
 
     def searches_last_24h(self) -> int:
         cutoff = self.now() - 86400
@@ -130,19 +162,6 @@ class Scheduler:
             (album_id, cutoff),
         ).fetchone()
         return row is not None
-
-    def select_candidates(self, albums: list[dict[str, Any]]) -> list[int]:
-        candidates: list[int] = []
-        for album in albums:
-            album_id = album.get("id", album.get("albumId"))
-            if album_id is None:
-                continue
-            album_id = int(album_id)
-            if not self.recently_searched(album_id):
-                candidates.append(album_id)
-            if len(candidates) >= MAX_SEARCHES_PER_RUN:
-                break
-        return candidates
 
     def record_search_start(self, album_ids: list[int], command_id: int) -> None:
         now = self.now()
@@ -230,20 +249,29 @@ class Scheduler:
             log.info("Rolling 24h search limit reached: %d/%d", used_today, MAX_SEARCHES_PER_DAY)
             return
 
-        missing = self.fetch_missing_albums()
-        if not missing:
+        candidate_limit = min(MAX_SEARCHES_PER_RUN, remaining_daily)
+        candidates, total_missing = self.fetch_missing_candidates(candidate_limit)
+
+        if total_missing == 0:
             log.info("No missing albums found.")
             return
 
-        candidates = self.select_candidates(missing)
-        candidates = candidates[:remaining_daily]
         if not candidates:
-            log.info("No missing albums are outside the %sh cooldown.", ALBUM_COOLDOWN_HOURS)
+            log.info(
+                "Missing albums: %d | no albums outside the %sh cooldown | rolling 24h searches: %d/%d",
+                total_missing,
+                ALBUM_COOLDOWN_HOURS,
+                used_today,
+                MAX_SEARCHES_PER_DAY,
+            )
             return
 
         log.info(
             "Missing albums: %d | eligible now: %d | rolling 24h searches: %d/%d",
-            len(missing), len(candidates), used_today, MAX_SEARCHES_PER_DAY,
+            total_missing,
+            len(candidates),
+            used_today,
+            MAX_SEARCHES_PER_DAY,
         )
 
         for offset in range(0, len(candidates), BATCH_SIZE):
