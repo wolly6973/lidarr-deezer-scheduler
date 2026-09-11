@@ -1,0 +1,21 @@
+services:
+  lidarr-deezer-scheduler:
+    build: .
+    container_name: lidarr-deezer-scheduler
+    restart: unless-stopped
+    environment:
+      LIDARR_URL: "${LIDARR_URL}"
+      LIDARR_API_KEY: "${LIDARR_API_KEY}"
+      SEARCH_INTERVAL_SECONDS: "${SEARCH_INTERVAL_SECONDS:-30}"
+      BATCH_SIZE: "${BATCH_SIZE:-5}"
+      MAX_SEARCHES_PER_RUN: "${MAX_SEARCHES_PER_RUN:-20}"
+      MAX_SEARCHES_PER_DAY: "${MAX_SEARCHES_PER_DAY:-100}"
+      ALBUM_COOLDOWN_HOURS: "${ALBUM_COOLDOWN_HOURS:-72}"
+      MISSING_PAGE_SIZE: "${MISSING_PAGE_SIZE:-500}"
+      COMMAND_TIMEOUT_SECONDS: "${COMMAND_TIMEOUT_SECONDS:-600}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    volumes:
+      - scheduler-data:/data
+
+volumes:
+  scheduler-data:
