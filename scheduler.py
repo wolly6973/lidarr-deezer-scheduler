@@ -1,5 +1,6 @@
 import logging
 import os
+import random
 import re
 import sqlite3
 import time
@@ -10,11 +11,11 @@ import requests
 
 LIDARR_URL = os.environ["LIDARR_URL"].rstrip("/")
 LIDARR_API_KEY = os.environ["LIDARR_API_KEY"]
-SEARCH_INTERVAL_SECONDS = int(os.getenv("SEARCH_INTERVAL_SECONDS", "30"))
 BATCH_SIZE = max(1, int(os.getenv("BATCH_SIZE", "5")))
-MAX_DOWNLOADS_PER_RUN = max(1, int(os.getenv("MAX_DOWNLOADS_PER_RUN", "20")))
-MAX_SEARCHES_PER_RUN = max(1, int(os.getenv("MAX_SEARCHES_PER_RUN", "100")))
 MAX_SEARCHES_PER_DAY = max(1, int(os.getenv("MAX_SEARCHES_PER_DAY", "100")))
+MIN_CHUNK_DELAY_SECONDS = max(60, int(os.getenv("MIN_CHUNK_DELAY_SECONDS", "900")))
+MAX_CHUNK_DELAY_SECONDS = max(MIN_CHUNK_DELAY_SECONDS, int(os.getenv("MAX_CHUNK_DELAY_SECONDS", "2700")))
+IDLE_RETRY_SECONDS = max(60, int(os.getenv("IDLE_RETRY_SECONDS", "300")))
 ALBUM_COOLDOWN_HOURS = max(0, float(os.getenv("ALBUM_COOLDOWN_HOURS", "72")))
 MISSING_PAGE_SIZE = max(50, int(os.getenv("MISSING_PAGE_SIZE", "500")))
 COMMAND_TIMEOUT_SECONDS = max(60, int(os.getenv("COMMAND_TIMEOUT_SECONDS", "600")))
@@ -81,13 +82,7 @@ class Scheduler:
         return response.json()
 
     def fetch_missing_candidates(self, limit: int) -> tuple[list[int], int]:
-        """Page through missing albums until enough eligible candidates are found.
-
-        We intentionally do not load the entire missing backlog into memory. Lidarr can
-        have tens of thousands of missing albums, so stop paging as soon as this run has
-        enough albums to search. The returned count is the total missing-record count
-        reported by Lidarr, when available.
-        """
+        """Page through missing albums until enough eligible candidates are found."""
         candidates: list[int] = []
         seen: set[int] = set()
         page = 1
@@ -155,6 +150,18 @@ class Scheduler:
         ).fetchone()
         return int(row["count"])
 
+    def seconds_until_daily_capacity(self) -> int:
+        """Return seconds until at least one rolling-24h search slot opens."""
+        cutoff = self.now() - 86400
+        row = self.db.execute(
+            "SELECT MIN(searched_at) AS oldest FROM search_events WHERE searched_at >= ?",
+            (cutoff,),
+        ).fetchone()
+        oldest = row["oldest"]
+        if oldest is None:
+            return 0
+        return max(1, int(oldest) + 86400 - self.now() + 1)
+
     def recently_searched(self, album_id: int) -> bool:
         if ALBUM_COOLDOWN_HOURS <= 0:
             return False
@@ -169,10 +176,7 @@ class Scheduler:
         now = self.now()
         for album_id in album_ids:
             self.db.execute(
-                """
-                INSERT INTO search_events(album_id, searched_at, command_id, result)
-                VALUES (?, ?, ?, ?)
-                """,
+                "INSERT INTO search_events(album_id, searched_at, command_id, result) VALUES (?, ?, ?, ?)",
                 (album_id, now, command_id, "started"),
             )
             self.db.execute(
@@ -191,11 +195,7 @@ class Scheduler:
     def record_search_result(self, album_ids: list[int], command_id: int, result: str, success: bool) -> None:
         now = self.now()
         self.db.executemany(
-            """
-            UPDATE search_events
-            SET result = ?
-            WHERE command_id = ? AND album_id = ?
-            """,
+            "UPDATE search_events SET result = ? WHERE command_id = ? AND album_id = ?",
             [(result, command_id, album_id) for album_id in album_ids],
         )
         for album_id in album_ids:
@@ -211,7 +211,6 @@ class Scheduler:
 
     @staticmethod
     def parse_download_count(result: str) -> int:
-        """Extract Lidarr's report-download count from its command message."""
         match = re.search(r"(\d+)\s+reports?\s+downloaded", result, re.IGNORECASE)
         return int(match.group(1)) if match else 0
 
@@ -248,29 +247,33 @@ class Scheduler:
         self.record_search_result(album_ids, command_id, result, success)
 
         if success:
-            log.info(
-                "Completed AlbumSearch command %s: %s | downloads initiated: %d",
-                command_id,
-                result,
-                download_count,
-            )
+            log.info("Completed AlbumSearch command %s: %s | downloads initiated: %d", command_id, result, download_count)
         else:
             log.error("AlbumSearch command %s did not complete successfully: %s", command_id, result)
         return success, download_count
 
-    def run_once(self) -> None:
+    def run_once(self) -> int:
+        """Run one small chunk and return how long to wait before the next chunk."""
         used_today = self.searches_last_24h()
         remaining_daily = max(0, MAX_SEARCHES_PER_DAY - used_today)
-        if remaining_daily <= 0:
-            log.info("Rolling 24h search limit reached: %d/%d", used_today, MAX_SEARCHES_PER_DAY)
-            return
 
-        candidate_limit = min(MAX_SEARCHES_PER_RUN, remaining_daily)
-        candidates, total_missing = self.fetch_missing_candidates(candidate_limit)
+        if remaining_daily <= 0:
+            wait = self.seconds_until_daily_capacity()
+            log.info(
+                "Rolling 24h search limit reached: %d/%d | pausing for %dm %ds",
+                used_today,
+                MAX_SEARCHES_PER_DAY,
+                wait // 60,
+                wait % 60,
+            )
+            return wait
+
+        chunk_size = min(BATCH_SIZE, remaining_daily)
+        candidates, total_missing = self.fetch_missing_candidates(chunk_size)
 
         if total_missing == 0:
             log.info("No missing albums found.")
-            return
+            return IDLE_RETRY_SECONDS
 
         if not candidates:
             log.info(
@@ -280,71 +283,62 @@ class Scheduler:
                 used_today,
                 MAX_SEARCHES_PER_DAY,
             )
-            return
+            return IDLE_RETRY_SECONDS
 
         log.info(
-            "Missing albums: %d | eligible now: %d | target downloads this run: %d | rolling 24h searches: %d/%d",
-            total_missing,
-            len(candidates),
-            MAX_DOWNLOADS_PER_RUN,
-            used_today,
-            MAX_SEARCHES_PER_DAY,
+            "Starting random search chunk: %d album(s) | missing=%d | rolling 24h searches=%d/%d",
+            len(candidates), total_missing, used_today, MAX_SEARCHES_PER_DAY,
         )
 
-        downloads_in_run = 0
-        searches_in_run = 0
+        success, download_count = self.run_search(candidates)
+        new_used = used_today + len(candidates)
 
-        for offset in range(0, len(candidates), BATCH_SIZE):
-            batch = candidates[offset : offset + BATCH_SIZE]
-            success, download_count = self.run_search(batch)
-            searches_in_run += len(batch)
-            downloads_in_run += download_count
+        log.info(
+            "Chunk complete: searches=%d | rolling 24h searches=%d/%d | downloads initiated=%d",
+            len(candidates), new_used, MAX_SEARCHES_PER_DAY, download_count,
+        )
 
+        if not success:
+            log.warning("Search chunk did not complete successfully; using the normal random delay before retrying")
+
+        if new_used >= MAX_SEARCHES_PER_DAY:
+            wait = self.seconds_until_daily_capacity()
             log.info(
-                "Run progress: downloads=%d/%d searches=%d/%d",
-                downloads_in_run,
-                MAX_DOWNLOADS_PER_RUN,
-                searches_in_run,
-                MAX_SEARCHES_PER_RUN,
+                "Rolling 24h search limit now full: %d/%d | pausing for %dm %ds",
+                new_used, MAX_SEARCHES_PER_DAY, wait // 60, wait % 60,
             )
+            return wait
 
-            if downloads_in_run >= MAX_DOWNLOADS_PER_RUN:
-                log.info(
-                    "Download limit reached for this run: %d/%d downloads initiated",
-                    downloads_in_run,
-                    MAX_DOWNLOADS_PER_RUN,
-                )
-                break
-
-            if not success:
-                log.warning("Search batch did not complete successfully; continuing with the next batch")
-
-            if offset + BATCH_SIZE < len(candidates):
-                log.info("Waiting %ss before next batch", SEARCH_INTERVAL_SECONDS)
-                time.sleep(SEARCH_INTERVAL_SECONDS)
+        delay = random.randint(MIN_CHUNK_DELAY_SECONDS, MAX_CHUNK_DELAY_SECONDS)
+        log.info(
+            "Next search chunk scheduled in %dm %ds (random range %dm-%dm)",
+            delay // 60, delay % 60,
+            MIN_CHUNK_DELAY_SECONDS // 60, MAX_CHUNK_DELAY_SECONDS // 60,
+        )
+        return delay
 
     def run_forever(self) -> None:
         log.info("Lidarr Deezer Scheduler starting")
         log.info("Lidarr URL: %s", LIDARR_URL)
         log.info(
-            "Config: interval=%ss batch=%d max downloads/run=%d max searches/run=%d max searches/24h=%d cooldown=%sh",
-            SEARCH_INTERVAL_SECONDS,
-            BATCH_SIZE,
-            MAX_DOWNLOADS_PER_RUN,
-            MAX_SEARCHES_PER_RUN,
-            MAX_SEARCHES_PER_DAY,
-            ALBUM_COOLDOWN_HOURS,
+            "Config: batch=%d max searches/24h=%d random chunk delay=%d-%ds cooldown=%sh idle retry=%ds",
+            BATCH_SIZE, MAX_SEARCHES_PER_DAY,
+            MIN_CHUNK_DELAY_SECONDS, MAX_CHUNK_DELAY_SECONDS,
+            ALBUM_COOLDOWN_HOURS, IDLE_RETRY_SECONDS,
         )
 
         while True:
             try:
-                self.run_once()
+                delay = self.run_once()
             except requests.RequestException as exc:
                 log.error("Lidarr API request failed: %s", exc)
+                delay = IDLE_RETRY_SECONDS
             except Exception:
                 log.exception("Unexpected scheduler error")
+                delay = IDLE_RETRY_SECONDS
 
-            time.sleep(SEARCH_INTERVAL_SECONDS)
+            log.info("Scheduler sleeping for %d seconds", delay)
+            time.sleep(delay)
 
 
 if __name__ == "__main__":
