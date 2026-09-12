@@ -19,6 +19,8 @@ IDLE_RETRY_SECONDS = max(60, int(os.getenv("IDLE_RETRY_SECONDS", "300")))
 ALBUM_COOLDOWN_HOURS = max(0, float(os.getenv("ALBUM_COOLDOWN_HOURS", "72")))
 MISSING_PAGE_SIZE = max(50, int(os.getenv("MISSING_PAGE_SIZE", "500")))
 COMMAND_TIMEOUT_SECONDS = max(60, int(os.getenv("COMMAND_TIMEOUT_SECONDS", "600")))
+MANAGE_DEEZER_AUTOMATIC_SEARCH = os.getenv("MANAGE_DEEZER_AUTOMATIC_SEARCH", "true").lower() in {"1", "true", "yes", "on"}
+DEEZER_INDEXER_NAME = os.getenv("DEEZER_INDEXER_NAME", "Deezer")
 DB_PATH = os.getenv("DB_PATH", "/data/scheduler.db")
 
 
@@ -80,6 +82,43 @@ class Scheduler:
         response = self.session.post(url, json=payload, timeout=30)
         response.raise_for_status()
         return response.json()
+
+    def put_json(self, path: str, payload: dict[str, Any]) -> Any:
+        url = f"{LIDARR_URL}/api/v1/{path.lstrip('/')}"
+        response = self.session.put(url, json=payload, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    def set_deezer_automatic_search(self, enabled: bool) -> bool:
+        """Toggle Deezer's Lidarr Automatic Search setting without changing other fields."""
+        if not MANAGE_DEEZER_AUTOMATIC_SEARCH:
+            return True
+
+        indexers = self.get_json("indexer")
+        indexer = next(
+            (item for item in indexers if str(item.get("name", "")).lower() == DEEZER_INDEXER_NAME.lower()),
+            None,
+        )
+        if indexer is None:
+            raise RuntimeError(f"Lidarr indexer '{DEEZER_INDEXER_NAME}' was not found")
+
+        current = bool(indexer.get("enableAutomaticSearch", False))
+        if current == enabled:
+            return True
+
+        indexer_id = indexer.get("id")
+        if indexer_id is None:
+            raise RuntimeError(f"Lidarr indexer '{DEEZER_INDEXER_NAME}' has no id")
+
+        updated = dict(indexer)
+        updated["enableAutomaticSearch"] = enabled
+        self.put_json(f"indexer/{indexer_id}", updated)
+        log.info(
+            "Deezer Automatic Search %s (indexer id %s)",
+            "enabled" if enabled else "disabled",
+            indexer_id,
+        )
+        return True
 
     def fetch_missing_candidates(self, limit: int) -> tuple[list[int], int]:
         """Page through missing albums until enough eligible candidates are found."""
@@ -216,41 +255,52 @@ class Scheduler:
 
     def run_search(self, album_ids: list[int]) -> tuple[bool, int]:
         payload = {"name": "AlbumSearch", "albumIds": album_ids}
-        data = self.post_json("command", payload)
-        command_id = int(data["id"])
-        self.record_search_start(album_ids, command_id)
 
-        log.info("Started Lidarr AlbumSearch command %s for %d album(s): %s", command_id, len(album_ids), album_ids)
+        if MANAGE_DEEZER_AUTOMATIC_SEARCH:
+            self.set_deezer_automatic_search(True)
 
-        deadline = time.time() + COMMAND_TIMEOUT_SECONDS
-        final: dict[str, Any] | None = None
-        while time.time() < deadline:
-            final = self.get_json(f"command/{command_id}")
-            status = str(final.get("status", "")).lower()
-            if status in {"completed", "failed", "canceled", "cancelled"}:
-                break
-            time.sleep(2)
+        try:
+            data = self.post_json("command", payload)
+            command_id = int(data["id"])
+            self.record_search_start(album_ids, command_id)
 
-        if final is None:
-            result = "command polling returned no result"
-            success = False
-        else:
-            status = str(final.get("status", "unknown")).lower()
-            result = final.get("message") or final.get("result") or status
-            success = status == "completed"
-            if time.time() >= deadline and status not in {"completed", "failed", "canceled", "cancelled"}:
-                result = f"command timeout after {COMMAND_TIMEOUT_SECONDS}s"
+            log.info("Started Lidarr AlbumSearch command %s for %d album(s): %s", command_id, len(album_ids), album_ids)
+
+            deadline = time.time() + COMMAND_TIMEOUT_SECONDS
+            final: dict[str, Any] | None = None
+            while time.time() < deadline:
+                final = self.get_json(f"command/{command_id}")
+                status = str(final.get("status", "")).lower()
+                if status in {"completed", "failed", "canceled", "cancelled"}:
+                    break
+                time.sleep(2)
+
+            if final is None:
+                result = "command polling returned no result"
                 success = False
+            else:
+                status = str(final.get("status", "unknown")).lower()
+                result = final.get("message") or final.get("result") or status
+                success = status == "completed"
+                if time.time() >= deadline and status not in {"completed", "failed", "canceled", "cancelled"}:
+                    result = f"command timeout after {COMMAND_TIMEOUT_SECONDS}s"
+                    success = False
 
-        result = str(result)
-        download_count = self.parse_download_count(result) if success else 0
-        self.record_search_result(album_ids, command_id, result, success)
+            result = str(result)
+            download_count = self.parse_download_count(result) if success else 0
+            self.record_search_result(album_ids, command_id, result, success)
 
-        if success:
-            log.info("Completed AlbumSearch command %s: %s | downloads initiated: %d", command_id, result, download_count)
-        else:
-            log.error("AlbumSearch command %s did not complete successfully: %s", command_id, result)
-        return success, download_count
+            if success:
+                log.info("Completed AlbumSearch command %s: %s | downloads initiated: %d", command_id, result, download_count)
+            else:
+                log.error("AlbumSearch command %s did not complete successfully: %s", command_id, result)
+            return success, download_count
+        finally:
+            if MANAGE_DEEZER_AUTOMATIC_SEARCH:
+                try:
+                    self.set_deezer_automatic_search(False)
+                except Exception:
+                    log.exception("Failed to disable Deezer Automatic Search after search chunk")
 
     def run_once(self) -> int:
         """Run one small chunk and return how long to wait before the next chunk."""
@@ -261,10 +311,7 @@ class Scheduler:
             wait = self.seconds_until_daily_capacity()
             log.info(
                 "Rolling 24h search limit reached: %d/%d | pausing for %dm %ds",
-                used_today,
-                MAX_SEARCHES_PER_DAY,
-                wait // 60,
-                wait % 60,
+                used_today, MAX_SEARCHES_PER_DAY, wait // 60, wait % 60,
             )
             return wait
 
@@ -278,10 +325,7 @@ class Scheduler:
         if not candidates:
             log.info(
                 "Missing albums: %d | no albums outside the %sh cooldown | rolling 24h searches: %d/%d",
-                total_missing,
-                ALBUM_COOLDOWN_HOURS,
-                used_today,
-                MAX_SEARCHES_PER_DAY,
+                total_missing, ALBUM_COOLDOWN_HOURS, used_today, MAX_SEARCHES_PER_DAY,
             )
             return IDLE_RETRY_SECONDS
 
@@ -321,20 +365,37 @@ class Scheduler:
         log.info("Lidarr Deezer Scheduler starting")
         log.info("Lidarr URL: %s", LIDARR_URL)
         log.info(
-            "Config: batch=%d max searches/24h=%d random chunk delay=%d-%ds cooldown=%sh idle retry=%ds",
+            "Config: batch=%d max searches/24h=%d random chunk delay=%d-%ds cooldown=%sh idle retry=%ds manage_deezer_automatic_search=%s",
             BATCH_SIZE, MAX_SEARCHES_PER_DAY,
             MIN_CHUNK_DELAY_SECONDS, MAX_CHUNK_DELAY_SECONDS,
             ALBUM_COOLDOWN_HOURS, IDLE_RETRY_SECONDS,
+            MANAGE_DEEZER_AUTOMATIC_SEARCH,
         )
+
+        if MANAGE_DEEZER_AUTOMATIC_SEARCH:
+            try:
+                self.set_deezer_automatic_search(False)
+            except Exception:
+                log.exception("Failed to establish safe starting state for Deezer Automatic Search")
 
         while True:
             try:
                 delay = self.run_once()
             except requests.RequestException as exc:
                 log.error("Lidarr API request failed: %s", exc)
+                if MANAGE_DEEZER_AUTOMATIC_SEARCH:
+                    try:
+                        self.set_deezer_automatic_search(False)
+                    except Exception:
+                        log.exception("Failed to disable Deezer Automatic Search after API error")
                 delay = IDLE_RETRY_SECONDS
             except Exception:
                 log.exception("Unexpected scheduler error")
+                if MANAGE_DEEZER_AUTOMATIC_SEARCH:
+                    try:
+                        self.set_deezer_automatic_search(False)
+                    except Exception:
+                        log.exception("Failed to disable Deezer Automatic Search after scheduler error")
                 delay = IDLE_RETRY_SECONDS
 
             log.info("Scheduler sleeping for %d seconds", delay)
