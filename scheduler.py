@@ -1,3 +1,4 @@
+
 import logging
 import os
 import random
@@ -35,6 +36,10 @@ FAIL_LOOKBACK_HOURS = max(1.0, float(os.getenv("FAIL_LOOKBACK_HOURS", "24")))
 FAIL_MIN_FAILURES = max(1, int(os.getenv("FAIL_MIN_FAILURES", "3")))
 FAIL_RATIO = min(1.0, max(0.0, float(os.getenv("FAIL_RATIO", "0.5"))))
 FAIL_PAUSE_HOURS = max(0.5, float(os.getenv("FAIL_PAUSE_HOURS", "12")))
+# Optional: exact name of the Lidarr download client that handles Deezer grabs.
+# Failures are attributed to this scheduler's Deezer traffic when they come from
+# DEEZER_INDEXER_NAME or this download client.
+DEEZER_DOWNLOAD_CLIENT_NAME = os.getenv("DEEZER_DOWNLOAD_CLIENT_NAME", "").strip()
 
 
 logging.basicConfig(
@@ -409,22 +414,57 @@ class Scheduler:
         except requests.RequestException as exc:
             log.warning("Could not read Lidarr health: %s", exc)
             health = []
-        problems = [
-            h for h in health
-            if str(h.get("type", "")).lower() == "error"
-            and any(k in str(h.get("source", "")).lower() for k in ("downloadclient", "indexer"))
-        ]
+        names = [n.lower() for n in (DEEZER_INDEXER_NAME, DEEZER_DOWNLOAD_CLIENT_NAME) if n]
+        problems = []
+        for h in health:
+            if str(h.get("type", "")).lower() != "error":
+                continue
+            if not any(k in str(h.get("source", "")).lower() for k in ("downloadclient", "indexer")):
+                continue
+            message = str(h.get("message", h.get("source", "?")))
+            if any(n in message.lower() for n in names):
+                problems.append(message)
+            else:
+                log.warning("Lidarr health error not attributed to Deezer (ignored): %s", message)
         if problems:
-            detail = "; ".join(str(h.get("message", h.get("source", "?"))) for h in problems)
-            return self.start_pause(f"Lidarr health error: {detail}")
+            return self.start_pause("Lidarr health error: " + "; ".join(problems))
 
         # 2. Recent grab vs. failure history
         ignore_before = int(self.get_kv("failure_ignore_before") or 0)
         since = max(now - int(FAIL_LOOKBACK_HOURS * 3600), ignore_before)
-        events = self.recent_history(since)
-        grabbed = sum(1 for e in events if str(e.get("eventType", "")).lower() == "grabbed")
-        failed = sum(1 for e in events if str(e.get("eventType", "")).lower() == "downloadfailed")
+        # Fetch extra history so a failure can be matched to a grab made before the window.
+        events = self.recent_history(now - int((FAIL_LOOKBACK_HOURS + 72) * 3600))
+
+        def etype(e: dict[str, Any]) -> str:
+            return str(e.get("eventType", "")).lower()
+
+        def direct_match(e: dict[str, Any]) -> bool:
+            data = e.get("data") or {}
+            if str(data.get("indexer", "")).lower() == DEEZER_INDEXER_NAME.lower():
+                return True
+            return bool(DEEZER_DOWNLOAD_CLIENT_NAME) and (
+                str(data.get("downloadClientName", "")).lower() == DEEZER_DOWNLOAD_CLIENT_NAME.lower()
+            )
+
+        grabs = [e for e in events if etype(e) == "grabbed"]
+        can_attribute = any("indexer" in (e.get("data") or {}) for e in grabs)
+        deezer_ids = {e.get("downloadId") for e in events if e.get("downloadId") and direct_match(e)}
+
+        def is_ours(e: dict[str, Any]) -> bool:
+            if not can_attribute:
+                return True
+            return direct_match(e) or (e.get("downloadId") in deezer_ids)
+
+        in_window = [e for e in events if self.parse_iso(e.get("date")) >= since]
+        grabbed = sum(1 for e in in_window if etype(e) == "grabbed" and is_ours(e))
+        failed = sum(1 for e in in_window if etype(e) == "downloadfailed" and is_ours(e))
+        other_failed = sum(1 for e in in_window if etype(e) == "downloadfailed" and not is_ours(e))
         ratio = failed / max(grabbed, 1)
+
+        if not can_attribute and grabs:
+            log.warning("History events carry no indexer info; counting ALL grabs/failures, not just Deezer")
+        if other_failed:
+            log.info("Ignoring %d failed download(s) from other indexers/clients", other_failed)
 
         tripped = failed >= FAIL_MIN_FAILURES and ratio >= FAIL_RATIO
         if not tripped:
