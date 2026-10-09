@@ -24,6 +24,8 @@ services:
       FAIL_MIN_FAILURES: "${FAIL_MIN_FAILURES:-3}"
       FAIL_RATIO: "${FAIL_RATIO:-0.5}"
       FAIL_PAUSE_HOURS: "${FAIL_PAUSE_HOURS:-12}"
+      MANAGE_OTHER_INDEXERS: "${MANAGE_OTHER_INDEXERS:-true}"
+      OTHER_INDEXERS_EXCLUDE: "${OTHER_INDEXERS_EXCLUDE:-}"
     volumes:
       - scheduler-data:/data
 
