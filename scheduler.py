@@ -1,4 +1,4 @@
-
+import json
 import logging
 import os
 import random
@@ -23,6 +23,12 @@ MISSING_PAGE_SIZE = max(50, int(os.getenv("MISSING_PAGE_SIZE", "500")))
 COMMAND_TIMEOUT_SECONDS = max(60, int(os.getenv("COMMAND_TIMEOUT_SECONDS", "600")))
 MANAGE_DEEZER_AUTOMATIC_SEARCH = os.getenv("MANAGE_DEEZER_AUTOMATIC_SEARCH", "true").lower() in {"1", "true", "yes", "on"}
 DEEZER_INDEXER_NAME = os.getenv("DEEZER_INDEXER_NAME", "Deezer")
+# While a scheduled search runs, turn Automatic Search OFF on every other indexer and
+# restore it afterwards, so the search only queries Deezer. Only the "Automatic Search"
+# toggle is touched (RSS and Interactive Search stay as they are).
+MANAGE_OTHER_INDEXERS = os.getenv("MANAGE_OTHER_INDEXERS", "true").lower() in {"1", "true", "yes", "on"}
+# Comma-separated indexer names that should never be touched.
+OTHER_INDEXERS_EXCLUDE = {n.strip().lower() for n in os.getenv("OTHER_INDEXERS_EXCLUDE", "").split(",") if n.strip()}
 DB_PATH = os.getenv("DB_PATH", "/data/scheduler.db")
 
 # Ordering: "newest_artist" searches albums from the most recently added artists first.
@@ -114,6 +120,82 @@ class Scheduler:
         response = self.session.put(url, json=payload, timeout=30)
         response.raise_for_status()
         return response.json()
+
+    def set_indexer_search(self, indexer_id: int, enabled: bool) -> None:
+        """Set Automatic Search on one indexer, changing nothing else about it."""
+        indexer = self.get_json(f"indexer/{indexer_id}")
+        if bool(indexer.get("enableAutomaticSearch", False)) == enabled:
+            return
+        indexer["enableAutomaticSearch"] = enabled
+        # forceSave skips the connection test, so a flaky indexer can't block a toggle.
+        self.put_json(f"indexer/{indexer_id}?forceSave=true", indexer)
+
+    def disable_other_indexers(self) -> None:
+        """Turn off Automatic Search on all other indexers, remembering which ones."""
+        if not MANAGE_OTHER_INDEXERS:
+            return
+
+        targets = [
+            i for i in self.get_json("indexer")
+            if i.get("id") is not None
+            and bool(i.get("enableAutomaticSearch", False))
+            and str(i.get("name", "")).lower() != DEEZER_INDEXER_NAME.lower()
+            and str(i.get("name", "")).lower() not in OTHER_INDEXERS_EXCLUDE
+        ]
+        if not targets:
+            return
+
+        # Persist BEFORE changing anything, so a crash can always be undone.
+        stored = set(json.loads(self.get_kv("disabled_indexers") or "[]"))
+        stored |= {int(i["id"]) for i in targets}
+        self.set_kv("disabled_indexers", json.dumps(sorted(stored)))
+
+        for indexer in targets:
+            self.set_indexer_search(int(indexer["id"]), False)
+        log.info(
+            "Disabled Automatic Search on %d other indexer(s): %s",
+            len(targets), ", ".join(str(i.get("name")) for i in targets),
+        )
+
+    def restore_other_indexers(self) -> None:
+        """Re-enable Automatic Search on every indexer this scheduler disabled."""
+        ids = [int(i) for i in json.loads(self.get_kv("disabled_indexers") or "[]")]
+        if not ids:
+            return
+
+        remaining: list[int] = []
+        restored = 0
+        for indexer_id in ids:
+            try:
+                self.set_indexer_search(indexer_id, True)
+                restored += 1
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    log.warning("Indexer %s no longer exists; dropping it from the restore list", indexer_id)
+                else:
+                    log.error("Could not restore indexer %s: %s", indexer_id, exc)
+                    remaining.append(indexer_id)
+            except requests.RequestException as exc:
+                log.error("Could not restore indexer %s: %s", indexer_id, exc)
+                remaining.append(indexer_id)
+
+        self.set_kv("disabled_indexers", json.dumps(remaining))
+        if restored:
+            log.info("Restored Automatic Search on %d other indexer(s)", restored)
+        if remaining:
+            log.error("Still need to restore indexer id(s) %s; will retry", remaining)
+
+    def reset_indexers(self, context: str) -> None:
+        """Return to the idle state: Deezer off, all other indexers back on."""
+        if MANAGE_DEEZER_AUTOMATIC_SEARCH:
+            try:
+                self.set_deezer_automatic_search(False)
+            except Exception:
+                log.exception("Failed to disable Deezer Automatic Search (%s)", context)
+        try:
+            self.restore_other_indexers()
+        except Exception:
+            log.exception("Failed to restore other indexers (%s)", context)
 
     def set_deezer_automatic_search(self, enabled: bool) -> bool:
         """Toggle Deezer's Lidarr Automatic Search setting without changing other fields."""
@@ -325,10 +407,11 @@ class Scheduler:
     def run_search(self, album_ids: list[int]) -> tuple[bool, int]:
         payload = {"name": "AlbumSearch", "albumIds": album_ids}
 
-        if MANAGE_DEEZER_AUTOMATIC_SEARCH:
-            self.set_deezer_automatic_search(True)
-
         try:
+            self.disable_other_indexers()
+            if MANAGE_DEEZER_AUTOMATIC_SEARCH:
+                self.set_deezer_automatic_search(True)
+
             data = self.post_json("command", payload)
             command_id = int(data["id"])
             self.record_search_start(album_ids, command_id)
@@ -365,11 +448,7 @@ class Scheduler:
                 log.error("AlbumSearch command %s did not complete successfully: %s", command_id, result)
             return success, download_count
         finally:
-            if MANAGE_DEEZER_AUTOMATIC_SEARCH:
-                try:
-                    self.set_deezer_automatic_search(False)
-                except Exception:
-                    log.exception("Failed to disable Deezer Automatic Search after search chunk")
+            self.reset_indexers("after search chunk")
 
     def recent_history(self, since_ts: float) -> list[dict[str, Any]]:
         """Return Lidarr history events newer than since_ts."""
@@ -442,9 +521,11 @@ class Scheduler:
             data = e.get("data") or {}
             if str(data.get("indexer", "")).lower() == DEEZER_INDEXER_NAME.lower():
                 return True
-            return bool(DEEZER_DOWNLOAD_CLIENT_NAME) and (
-                str(data.get("downloadClientName", "")).lower() == DEEZER_DOWNLOAD_CLIENT_NAME.lower()
-            )
+            if not DEEZER_DOWNLOAD_CLIENT_NAME:
+                return False
+            # Lidarr uses "downloadClientName" on some events and "downloadClient" on others.
+            clients = {str(data.get(k, "")).lower() for k in ("downloadClientName", "downloadClient")}
+            return DEEZER_DOWNLOAD_CLIENT_NAME.lower() in clients
 
         grabs = [e for e in events if etype(e) == "grabbed"]
         can_attribute = any("indexer" in (e.get("data") or {}) for e in grabs)
@@ -457,14 +538,22 @@ class Scheduler:
 
         in_window = [e for e in events if self.parse_iso(e.get("date")) >= since]
         grabbed = sum(1 for e in in_window if etype(e) == "grabbed" and is_ours(e))
-        failed = sum(1 for e in in_window if etype(e) == "downloadfailed" and is_ours(e))
-        other_failed = sum(1 for e in in_window if etype(e) == "downloadfailed" and not is_ours(e))
+
+        def manual(e: dict[str, Any]) -> bool:
+            # Failures the user marked by hand say nothing about whether the ARL works.
+            return "manually marked" in str((e.get("data") or {}).get("message", "")).lower()
+
+        failed = sum(1 for e in in_window if etype(e) == "downloadfailed" and is_ours(e) and not manual(e))
+        other_failed = sum(
+            1 for e in in_window
+            if etype(e) == "downloadfailed" and (not is_ours(e) or manual(e))
+        )
         ratio = failed / max(grabbed, 1)
 
         if not can_attribute and grabs:
             log.warning("History events carry no indexer info; counting ALL grabs/failures, not just Deezer")
         if other_failed:
-            log.info("Ignoring %d failed download(s) from other indexers/clients", other_failed)
+            log.info("Ignoring %d failed download(s) from other indexers/clients or marked failed manually", other_failed)
 
         tripped = failed >= FAIL_MIN_FAILURES and ratio >= FAIL_RATIO
         if not tripped:
@@ -546,6 +635,8 @@ class Scheduler:
     def run_forever(self) -> None:
         log.info("Lidarr Deezer Scheduler starting")
         log.info("Lidarr URL: %s", LIDARR_URL)
+        log.info("Deezer-only searches: manage_other_indexers=%s excluded=%s",
+                 MANAGE_OTHER_INDEXERS, sorted(OTHER_INDEXERS_EXCLUDE) or "none")
         log.info(
             "Order=%s | safety check=%s (pause %.0fh at >=%d failures and >=%.0f%% of grabs in %.0fh)",
             SEARCH_ORDER, SAFETY_CHECK_ENABLED, FAIL_PAUSE_HOURS, FAIL_MIN_FAILURES,
@@ -559,30 +650,18 @@ class Scheduler:
             MANAGE_DEEZER_AUTOMATIC_SEARCH,
         )
 
-        if MANAGE_DEEZER_AUTOMATIC_SEARCH:
-            try:
-                self.set_deezer_automatic_search(False)
-            except Exception:
-                log.exception("Failed to establish safe starting state for Deezer Automatic Search")
+        self.reset_indexers("at startup")
 
         while True:
             try:
                 delay = self.run_once()
             except requests.RequestException as exc:
                 log.error("Lidarr API request failed: %s", exc)
-                if MANAGE_DEEZER_AUTOMATIC_SEARCH:
-                    try:
-                        self.set_deezer_automatic_search(False)
-                    except Exception:
-                        log.exception("Failed to disable Deezer Automatic Search after API error")
+                self.reset_indexers("after API error")
                 delay = IDLE_RETRY_SECONDS
             except Exception:
                 log.exception("Unexpected scheduler error")
-                if MANAGE_DEEZER_AUTOMATIC_SEARCH:
-                    try:
-                        self.set_deezer_automatic_search(False)
-                    except Exception:
-                        log.exception("Failed to disable Deezer Automatic Search after scheduler error")
+                self.reset_indexers("after scheduler error")
                 delay = IDLE_RETRY_SECONDS
 
             log.info("Scheduler sleeping for %d seconds", delay)
