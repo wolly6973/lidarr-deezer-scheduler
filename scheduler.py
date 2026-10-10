@@ -5,7 +5,7 @@ import random
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -14,7 +14,12 @@ import requests
 LIDARR_URL = os.environ["LIDARR_URL"].rstrip("/")
 LIDARR_API_KEY = os.environ["LIDARR_API_KEY"]
 BATCH_SIZE = max(1, int(os.getenv("BATCH_SIZE", "5")))
+# Daily search cap: each local day a random cap between MIN and MAX is chosen.
+# MIN_SEARCHES_PER_DAY defaults to 70% of the max when not set.
 MAX_SEARCHES_PER_DAY = max(1, int(os.getenv("MAX_SEARCHES_PER_DAY", "100")))
+_min_searches_env = os.getenv("MIN_SEARCHES_PER_DAY", "").strip()
+MIN_SEARCHES_PER_DAY = int(_min_searches_env) if _min_searches_env else int(MAX_SEARCHES_PER_DAY * 0.7)
+MIN_SEARCHES_PER_DAY = max(1, min(MIN_SEARCHES_PER_DAY, MAX_SEARCHES_PER_DAY))
 MIN_CHUNK_DELAY_SECONDS = max(60, int(os.getenv("MIN_CHUNK_DELAY_SECONDS", "900")))
 MAX_CHUNK_DELAY_SECONDS = max(MIN_CHUNK_DELAY_SECONDS, int(os.getenv("MAX_CHUNK_DELAY_SECONDS", "2700")))
 IDLE_RETRY_SECONDS = max(60, int(os.getenv("IDLE_RETRY_SECONDS", "300")))
@@ -42,6 +47,15 @@ FAIL_LOOKBACK_HOURS = max(1.0, float(os.getenv("FAIL_LOOKBACK_HOURS", "24")))
 FAIL_MIN_FAILURES = max(1, int(os.getenv("FAIL_MIN_FAILURES", "3")))
 FAIL_RATIO = min(1.0, max(0.0, float(os.getenv("FAIL_RATIO", "0.5"))))
 FAIL_PAUSE_HOURS = max(0.5, float(os.getenv("FAIL_PAUSE_HOURS", "12")))
+
+# Daily grab cap: each local day, a random cap between MIN and MAX is chosen, and searching
+# stops once that many Deezer grabs have happened. Set MAX_DOWNLOADS_PER_DAY=0 to disable.
+MAX_DOWNLOADS_PER_DAY = max(0, int(os.getenv("MAX_DOWNLOADS_PER_DAY", "30")))
+_min_downloads_env = os.getenv("MIN_DOWNLOADS_PER_DAY", "").strip()
+# An unset minimum defaults to 10 but never exceeds the max; an explicit backwards range is swapped.
+MIN_DOWNLOADS_PER_DAY = max(0, int(_min_downloads_env)) if _min_downloads_env else min(10, MAX_DOWNLOADS_PER_DAY)
+if MAX_DOWNLOADS_PER_DAY > 0 and MIN_DOWNLOADS_PER_DAY > MAX_DOWNLOADS_PER_DAY:
+    MIN_DOWNLOADS_PER_DAY, MAX_DOWNLOADS_PER_DAY = MAX_DOWNLOADS_PER_DAY, MIN_DOWNLOADS_PER_DAY
 # Optional: exact name of the Lidarr download client that handles Deezer grabs.
 # Failures are attributed to this scheduler's Deezer traffic when they come from
 # DEEZER_INDEXER_NAME or this download client.
@@ -450,6 +464,86 @@ class Scheduler:
         finally:
             self.reset_indexers("after search chunk")
 
+    @staticmethod
+    def deezer_match(e: dict[str, Any]) -> bool:
+        """True if a history event came from the Deezer indexer (or the optional Deezer client)."""
+        data = e.get("data") or {}
+        if str(data.get("indexer", "")).lower() == DEEZER_INDEXER_NAME.lower():
+            return True
+        if not DEEZER_DOWNLOAD_CLIENT_NAME:
+            return False
+        # Lidarr uses "downloadClientName" on some events and "downloadClient" on others.
+        clients = {str(data.get(k, "")).lower() for k in ("downloadClientName", "downloadClient")}
+        return DEEZER_DOWNLOAD_CLIENT_NAME.lower() in clients
+
+    @staticmethod
+    def local_now() -> datetime:
+        return datetime.now().astimezone()
+
+    def seconds_until_next_day(self) -> int:
+        now = self.local_now()
+        tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return max(1, int((tomorrow - now).total_seconds()))
+
+    def todays_search_cap(self) -> int:
+        """Today's randomly chosen search cap (kept for the whole local day)."""
+        today = self.local_now().strftime("%Y-%m-%d")
+        stored_day = self.get_kv("search_cap_day")
+        stored_value = self.get_kv("search_cap_value")
+        if stored_day == today and stored_value is not None:
+            value = int(stored_value)
+            if MIN_SEARCHES_PER_DAY <= value <= MAX_SEARCHES_PER_DAY:
+                return value
+
+        value = random.randint(MIN_SEARCHES_PER_DAY, MAX_SEARCHES_PER_DAY)
+        self.set_kv("search_cap_day", today)
+        self.set_kv("search_cap_value", str(value))
+        log.info(
+            "New daily search cap for %s: %d (random from %d-%d)",
+            today, value, MIN_SEARCHES_PER_DAY, MAX_SEARCHES_PER_DAY,
+        )
+        return value
+
+    def searches_today(self) -> int:
+        """Albums searched since local midnight."""
+        day_start = int(self.local_now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        row = self.db.execute(
+            "SELECT COUNT(*) AS count FROM search_events WHERE searched_at >= ?",
+            (day_start,),
+        ).fetchone()
+        return int(row["count"])
+
+    def todays_grab_cap(self) -> int | None:
+        """Today's randomly chosen grab cap, or None when the cap is disabled."""
+        if MAX_DOWNLOADS_PER_DAY <= 0:
+            return None
+
+        today = self.local_now().strftime("%Y-%m-%d")
+        stored_day = self.get_kv("grab_cap_day")
+        stored_value = self.get_kv("grab_cap_value")
+        if stored_day == today and stored_value is not None:
+            value = int(stored_value)
+            if MIN_DOWNLOADS_PER_DAY <= value <= MAX_DOWNLOADS_PER_DAY:
+                return value
+
+        value = random.randint(MIN_DOWNLOADS_PER_DAY, MAX_DOWNLOADS_PER_DAY)
+        self.set_kv("grab_cap_day", today)
+        self.set_kv("grab_cap_value", str(value))
+        log.info(
+            "New daily grab cap for %s: %d (random from %d-%d)",
+            today, value, MIN_DOWNLOADS_PER_DAY, MAX_DOWNLOADS_PER_DAY,
+        )
+        return value
+
+    def deezer_grabs_today(self) -> int:
+        """Count Deezer grabs since local midnight, from Lidarr's history."""
+        day_start = self.local_now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        events = self.recent_history(day_start)
+        return sum(
+            1 for e in events
+            if str(e.get("eventType", "")).lower() == "grabbed" and self.deezer_match(e)
+        )
+
     def recent_history(self, since_ts: float) -> list[dict[str, Any]]:
         """Return Lidarr history events newer than since_ts."""
         iso = datetime.fromtimestamp(since_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -517,15 +611,7 @@ class Scheduler:
         def etype(e: dict[str, Any]) -> str:
             return str(e.get("eventType", "")).lower()
 
-        def direct_match(e: dict[str, Any]) -> bool:
-            data = e.get("data") or {}
-            if str(data.get("indexer", "")).lower() == DEEZER_INDEXER_NAME.lower():
-                return True
-            if not DEEZER_DOWNLOAD_CLIENT_NAME:
-                return False
-            # Lidarr uses "downloadClientName" on some events and "downloadClient" on others.
-            clients = {str(data.get(k, "")).lower() for k in ("downloadClientName", "downloadClient")}
-            return DEEZER_DOWNLOAD_CLIENT_NAME.lower() in clients
+        direct_match = self.deezer_match
 
         grabs = [e for e in events if etype(e) == "grabbed"]
         can_attribute = any("indexer" in (e.get("data") or {}) for e in grabs)
@@ -575,18 +661,33 @@ class Scheduler:
         if pause > 0:
             return pause
 
-        used_today = self.searches_last_24h()
-        remaining_daily = max(0, MAX_SEARCHES_PER_DAY - used_today)
+        grab_cap = self.todays_grab_cap()
+        grabs_today = self.deezer_grabs_today() if grab_cap is not None else 0
+        if grab_cap is not None and grabs_today >= grab_cap:
+            # Resume shortly after local midnight, with some jitter so it isn't clockwork.
+            wait = self.seconds_until_next_day() + random.randint(300, 3600)
+            log.info(
+                "Daily grab cap reached: %d/%d | pausing for %dh %dm",
+                grabs_today, grab_cap, wait // 3600, (wait % 3600) // 60,
+            )
+            return wait
+
+        search_cap = self.todays_search_cap()
+        used_today = self.searches_today()
+        remaining_daily = max(0, search_cap - used_today)
 
         if remaining_daily <= 0:
-            wait = self.seconds_until_daily_capacity()
+            wait = self.seconds_until_next_day() + random.randint(300, 3600)
             log.info(
-                "Rolling 24h search limit reached: %d/%d | pausing for %dm %ds",
-                used_today, MAX_SEARCHES_PER_DAY, wait // 60, wait % 60,
+                "Daily search cap reached: %d/%d | pausing for %dh %dm",
+                used_today, search_cap, wait // 3600, (wait % 3600) // 60,
             )
             return wait
 
         chunk_size = min(BATCH_SIZE, remaining_daily)
+        if grab_cap is not None:
+            # An album yields at most one grab, so this keeps a chunk from overshooting the cap.
+            chunk_size = min(chunk_size, grab_cap - grabs_today)
         candidates, total_missing = self.fetch_missing_candidates(chunk_size)
 
         if total_missing == 0:
@@ -595,32 +696,33 @@ class Scheduler:
 
         if not candidates:
             log.info(
-                "Missing albums: %d | no albums outside the %sh cooldown | rolling 24h searches: %d/%d",
-                total_missing, ALBUM_COOLDOWN_HOURS, used_today, MAX_SEARCHES_PER_DAY,
+                "Missing albums: %d | no albums outside the %sh cooldown | searches today: %d/%d",
+                total_missing, ALBUM_COOLDOWN_HOURS, used_today, search_cap,
             )
             return IDLE_RETRY_SECONDS
 
         log.info(
-            "Starting search chunk: %d album(s) | missing=%d | rolling 24h searches=%d/%d",
-            len(candidates), total_missing, used_today, MAX_SEARCHES_PER_DAY,
+            "Starting search chunk: %d album(s) | missing=%d | searches today=%d/%d | grabs today=%s",
+            len(candidates), total_missing, used_today, search_cap,
+            f"{grabs_today}/{grab_cap}" if grab_cap is not None else "uncapped",
         )
 
         success, download_count = self.run_search(candidates)
         new_used = used_today + len(candidates)
 
         log.info(
-            "Chunk complete: searches=%d | rolling 24h searches=%d/%d | downloads initiated=%d",
-            len(candidates), new_used, MAX_SEARCHES_PER_DAY, download_count,
+            "Chunk complete: searches=%d | searches today=%d/%d | downloads initiated=%d",
+            len(candidates), new_used, search_cap, download_count,
         )
 
         if not success:
             log.warning("Search chunk did not complete successfully; using the normal random delay before retrying")
 
-        if new_used >= MAX_SEARCHES_PER_DAY:
-            wait = self.seconds_until_daily_capacity()
+        if new_used >= search_cap:
+            wait = self.seconds_until_next_day() + random.randint(300, 3600)
             log.info(
-                "Rolling 24h search limit now full: %d/%d | pausing for %dm %ds",
-                new_used, MAX_SEARCHES_PER_DAY, wait // 60, wait % 60,
+                "Daily search cap now full: %d/%d | pausing for %dh %dm",
+                new_used, search_cap, wait // 3600, (wait % 3600) // 60,
             )
             return wait
 
@@ -643,8 +745,13 @@ class Scheduler:
             FAIL_RATIO * 100, FAIL_LOOKBACK_HOURS,
         )
         log.info(
-            "Config: batch=%d max searches/24h=%d random chunk delay=%d-%ds cooldown=%sh idle retry=%ds manage_deezer_automatic_search=%s",
-            BATCH_SIZE, MAX_SEARCHES_PER_DAY,
+            "Daily grab cap: %s",
+            f"random {MIN_DOWNLOADS_PER_DAY}-{MAX_DOWNLOADS_PER_DAY} per local day"
+            if MAX_DOWNLOADS_PER_DAY > 0 else "disabled",
+        )
+        log.info(
+            "Config: batch=%d daily searches=random %d-%d random chunk delay=%d-%ds cooldown=%sh idle retry=%ds manage_deezer_automatic_search=%s",
+            BATCH_SIZE, MIN_SEARCHES_PER_DAY, MAX_SEARCHES_PER_DAY,
             MIN_CHUNK_DELAY_SECONDS, MAX_CHUNK_DELAY_SECONDS,
             ALBUM_COOLDOWN_HOURS, IDLE_RETRY_SECONDS,
             MANAGE_DEEZER_AUTOMATIC_SEARCH,
