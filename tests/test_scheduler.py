@@ -42,7 +42,7 @@ class MissingCacheRefreshTests(unittest.TestCase):
         self.assertEqual(instance.get_kv("missing_page"), "2")
         self.assertGreater(instance.missing_cache_time, 0)
 
-    def test_wraps_cursor_after_last_page(self):
+    def test_keeps_cursor_on_page_until_page_is_consumed(self):
         instance = self.make_scheduler()
         instance.set_kv("missing_page", "3")
         instance.get_json = Mock(return_value={"totalRecords": 5, "records": [{"id": 5, "artistId": 1}]})
