@@ -11,8 +11,8 @@ from typing import Any
 import requests
 
 
-LIDARR_URL = os.environ["LIDARR_URL"].rstrip("/")
-LIDARR_API_KEY = os.environ["LIDARR_API_KEY"]
+LIDARR_URL = os.getenv("LIDARR_URL", "").strip().rstrip("/")
+LIDARR_API_KEY = os.getenv("LIDARR_API_KEY", "").strip()
 BATCH_SIZE = max(1, int(os.getenv("BATCH_SIZE", "5")))
 # Daily search cap: each local day a random cap between MIN and MAX is chosen.
 # MIN_SEARCHES_PER_DAY defaults to 70% of the max when not set.
@@ -62,8 +62,10 @@ if MAX_DOWNLOADS_PER_DAY > 0 and MIN_DOWNLOADS_PER_DAY > MAX_DOWNLOADS_PER_DAY:
 DEEZER_DOWNLOAD_CLIENT_NAME = os.getenv("DEEZER_DOWNLOAD_CLIENT_NAME", "").strip()
 
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=LOG_LEVEL,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("lidarr-deezer-scheduler")
