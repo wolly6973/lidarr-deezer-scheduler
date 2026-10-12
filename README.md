@@ -12,7 +12,7 @@ Each cycle ("chunk") does the following:
 
 1. **Safety check.** Skips the cycle (and sleeps) if a safety pause is active, if Lidarr reports a download client or indexer error for Deezer, or if recent Deezer downloads are failing. See [Safety check](#safety-check).
 2. **Daily caps.** Picks today's random grab cap and search cap (see [Daily caps](#daily-caps)). If either is used up, it sleeps until shortly after local midnight.
-3. **Chooses albums.** Takes the next few monitored, missing albums, ordered by how recently their artist was added to Lidarr (newest first), skipping albums still on cooldown.
+3. **Chooses albums.** Fetches one page of monitored, missing albums from Lidarr, rotating the page between refreshes so it does not crawl the entire missing list on every refresh. The page is cached locally for the configured refresh interval; eligible albums are selected from it, skipping albums still on cooldown. “Newest artist” ordering is applied within the fetched page.
 4. **Swaps indexers.** Turns **Automatic Search off** on every other indexer (the list is saved to the database first) and **on** for Deezer.
 5. **Searches.** Sends one `AlbumSearch` command for the batch and waits for it to finish.
 6. **Restores.** Turns Deezer off and re-enables exactly the indexers it disabled.
@@ -137,7 +137,7 @@ docker exec lidarr-deezer-scheduler python -c "import sqlite3,time;d=sqlite3.con
 
 **Other indexers stuck off.** Restart the container; the startup step restores any indexers it disabled. You can also re-enable Automatic Search on them manually in Lidarr.
 
-**Nothing happens after the first log lines.** On a large library, the first load of the missing list can take many minutes (about 20 for roughly 30,000 albums). Wait for the `Missing list refreshed` line.
+**Lidarr is slow or the scheduler reports API timeouts.** The scheduler fetches only one page of missing albums per refresh and rotates through pages instead of making a request for every page. The wanted/missing endpoint can still be expensive on very large libraries; the scheduler gives that request up to 90 seconds and waits at least 30 minutes after an API error to avoid repeatedly hammering Lidarr. Look for `Missing page refreshed` in the logs.
 
 **See how much has been searched:**
 
