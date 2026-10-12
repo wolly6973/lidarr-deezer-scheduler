@@ -35,6 +35,7 @@ MANAGE_OTHER_INDEXERS = os.getenv("MANAGE_OTHER_INDEXERS", "true").lower() in {"
 # Comma-separated indexer names that should never be touched.
 OTHER_INDEXERS_EXCLUDE = {n.strip().lower() for n in os.getenv("OTHER_INDEXERS_EXCLUDE", "").split(",") if n.strip()}
 DB_PATH = os.getenv("DB_PATH", "/data/scheduler.db")
+TZ = os.getenv("TZ", "America/Chicago")
 
 # Ordering: "newest_artist" searches albums from the most recently added artists first.
 # "random" picks albums in random order.
