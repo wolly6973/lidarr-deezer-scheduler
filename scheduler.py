@@ -332,15 +332,15 @@ class Scheduler:
         self.missing_cache_time = time.time()
 
         page_count = max(1, (total + MISSING_PAGE_SIZE - 1) // MISSING_PAGE_SIZE)
-        next_page = page + 1 if page < page_count else 1
-        if not records and total > 0 and page > 1:
-            # The library shrank since the cursor was saved. Restart at page 1 next time.
-            next_page = 1
-        self.set_kv("missing_page", str(next_page))
-
+        if not records and page > page_count:
+            # The missing list shrank since the cursor was saved. Restart at page 1.
+            self.set_kv("missing_page", "1")
+            if total > 0:
+                self.missing_cache_time = 0.0
+                return self.refresh_missing_cache()
         log.info(
-            "Missing page refreshed: page=%d/%d cached=%d album(s), order=%s, total_missing=%d, next_page=%d, elapsed=%.1fs",
-            page, page_count, len(self.missing_cache), SEARCH_ORDER, total, next_page,
+            "Missing page loaded: page=%d/%d cached=%d album(s), order=%s, total_missing=%d, elapsed=%.1fs",
+            page, page_count, len(self.missing_cache), SEARCH_ORDER, total,
             time.monotonic() - started,
         )
         if missing_artist_dates:
@@ -357,22 +357,43 @@ class Scheduler:
         return {int(row[0]) for row in rows}
 
     def fetch_missing_candidates(self, limit: int) -> tuple[list[int], int]:
-        """Return the next eligible albums from the cached, ordered missing list."""
-        cache_age = time.time() - self.missing_cache_time
-        if self.missing_cache_time == 0 or cache_age > MISSING_REFRESH_MINUTES * 60:
+        """Return eligible albums from one cached page, rotating only after it is exhausted."""
+        if self.missing_cache_time == 0:
             self.refresh_missing_cache()
 
         on_cooldown = self.cooldown_ids()
-        candidates: list[int] = []
-        for album_id in self.missing_cache:
-            if album_id in on_cooldown:
-                continue
-            candidates.append(album_id)
-            if len(candidates) >= limit:
-                break
+        candidates = [
+            album_id for album_id in self.missing_cache
+            if album_id not in on_cooldown
+        ][:limit]
+        cache_age = time.time() - self.missing_cache_time
+
+        # Keep a page until its albums have been attempted or are already on cooldown.
+        # This avoids throwing away most of a 500-item page every six hours.
+        if (
+            not candidates
+            and self.missing_total > 0
+            and self.missing_cache_time > 0
+            and cache_age >= MISSING_REFRESH_MINUTES * 60
+        ):
+            page = max(1, int(self.get_kv("missing_page") or "1"))
+            page_count = max(1, (self.missing_total + MISSING_PAGE_SIZE - 1) // MISSING_PAGE_SIZE)
+            next_page = page + 1 if page < page_count else 1
+            self.set_kv("missing_page", str(next_page))
+            self.missing_cache = []
+            self.missing_cache_time = 0.0
+            log.info("Missing page %d exhausted; rotating to page %d/%d", page, next_page, page_count)
+
+            # Fetch at most one new page in this cycle, even if it contains only cooldown albums.
+            self.refresh_missing_cache()
+            on_cooldown = self.cooldown_ids()
+            candidates = [
+                album_id for album_id in self.missing_cache
+                if album_id not in on_cooldown
+            ][:limit]
 
         log.info(
-            "Candidate scan: eligible=%d/%d | cached=%d | on cooldown=%d | total_missing=%d",
+            "Candidate scan: eligible=%d/%d | cached_page=%d | on cooldown=%d | total_missing=%d",
             len(candidates), limit, len(self.missing_cache), len(on_cooldown), self.missing_total,
         )
         return candidates, self.missing_total
