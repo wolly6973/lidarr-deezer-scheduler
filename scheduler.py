@@ -276,11 +276,11 @@ class Scheduler:
         self.db.commit()
 
     def refresh_missing_cache(self) -> None:
-        """Fetch one page of missing albums, rotating pages to avoid a library-wide crawl.
+        """Fetch the current page of missing albums without crawling the entire library.
 
         Lidarr's wanted/missing endpoint performs an expensive count query. Fetching every
-        page repeatedly multiplies that cost by the number of pages, so we cache one page
-        per refresh interval and persist a rotating page cursor in the scheduler database.
+        page repeatedly multiplies that cost by the number of pages, so keep one page cached
+        and persist its page number. Advance only after its entries are exhausted/on cooldown.
         """
         page = max(1, int(self.get_kv("missing_page") or "1"))
         started = time.monotonic()
