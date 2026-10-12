@@ -120,11 +120,21 @@ class Scheduler:
     def now() -> int:
         return int(time.time())
 
-    def get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    def get_json(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        timeout: int = 30,
+    ) -> Any:
+        """GET a Lidarr resource; allow a longer timeout only for known expensive endpoints."""
         url = f"{LIDARR_URL}/api/v1/{path.lstrip('/')}"
-        response = self.session.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        return response.json()
+        started = time.monotonic()
+        try:
+            response = self.session.get(url, params=params, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        finally:
+            log.debug("Lidarr GET %s completed in %.2fs", path, time.monotonic() - started)
 
     def post_json(self, path: str, payload: dict[str, Any]) -> Any:
         url = f"{LIDARR_URL}/api/v1/{path.lstrip('/')}"
@@ -266,60 +276,78 @@ class Scheduler:
         self.db.commit()
 
     def refresh_missing_cache(self) -> None:
-        """Load all missing albums and order them according to SEARCH_ORDER."""
-        added_by_artist: dict[int, float] = {}
-        if SEARCH_ORDER == "newest_artist":
-            for artist in self.get_json("artist"):
-                if artist.get("id") is not None:
-                    added_by_artist[int(artist["id"])] = self.parse_iso(artist.get("added"))
+        """Fetch one page of missing albums, rotating pages to avoid a library-wide crawl.
 
-        entries: list[tuple[int, int]] = []  # (album_id, artist_id)
+        Lidarr's wanted/missing endpoint performs an expensive count query. Fetching every
+        page repeatedly multiplies that cost by the number of pages, so we cache one page
+        per refresh interval and persist a rotating page cursor in the scheduler database.
+        """
+        page = max(1, int(self.get_kv("missing_page") or "1"))
+        started = time.monotonic()
+        data = self.get_json(
+            "wanted/missing",
+            params={
+                "page": page,
+                "pageSize": MISSING_PAGE_SIZE,
+                "sortKey": "title",
+                "sortDirection": "ascending",
+            },
+            # This endpoint can take longer than ordinary Lidarr API calls on large libraries.
+            timeout=90,
+        )
+        records = data.get("records", []) if isinstance(data, dict) else []
+        total = int(data.get("totalRecords", 0)) if isinstance(data, dict) else 0
+
+        entries: list[tuple[int, int, float]] = []  # (album_id, artist_id, artist_added)
         seen: set[int] = set()
-        page = 1
-        total = 0
-        while True:
-            data = self.get_json(
-                "wanted/missing",
-                params={
-                    "page": page,
-                    "pageSize": MISSING_PAGE_SIZE,
-                    "sortKey": "title",
-                    "sortDirection": "ascending",
-                },
-            )
-            records = data.get("records", [])
-            total = int(data.get("totalRecords", total))
-            for record in records:
-                album_id = record.get("id")
-                if album_id is None:
-                    album_id = record.get("albumId")
-                if album_id is None:
-                    continue
-                album_id = int(album_id)
-                if album_id in seen:
-                    continue
-                seen.add(album_id)
-                artist_id = record.get("artistId")
-                if artist_id is None:
-                    artist_id = (record.get("artist") or {}).get("id", 0)
-                entries.append((album_id, int(artist_id or 0)))
-
-            if not records or len(records) < MISSING_PAGE_SIZE or len(seen) >= total:
-                break
-            page += 1
+        missing_artist_dates = 0
+        for record in records:
+            album_id = record.get("id")
+            if album_id is None:
+                album_id = record.get("albumId")
+            if album_id is None:
+                continue
+            album_id = int(album_id)
+            if album_id in seen:
+                continue
+            seen.add(album_id)
+            artist = record.get("artist") or {}
+            artist_id = record.get("artistId")
+            if artist_id is None:
+                artist_id = artist.get("id", 0)
+            artist_added = self.parse_iso(artist.get("added"))
+            if SEARCH_ORDER == "newest_artist" and not artist_added:
+                missing_artist_dates += 1
+            entries.append((album_id, int(artist_id or 0), artist_added))
 
         if SEARCH_ORDER == "random":
             random.shuffle(entries)
         else:
-            entries.sort(key=lambda e: (-added_by_artist.get(e[1], 0.0), e[1], e[0]))
+            # The API response embeds artist data; use it rather than issuing a separate
+            # full /artist request. Ordering is within this page, not across the whole library.
+            entries.sort(key=lambda e: (-e[2], e[1], e[0]))
 
-        self.missing_cache = [album_id for album_id, _ in entries]
+        self.missing_cache = [album_id for album_id, _, _ in entries]
         self.missing_total = total
         self.missing_cache_time = time.time()
+
+        page_count = max(1, (total + MISSING_PAGE_SIZE - 1) // MISSING_PAGE_SIZE)
+        next_page = page + 1 if page < page_count else 1
+        if not records and total > 0 and page > 1:
+            # The library shrank since the cursor was saved. Restart at page 1 next time.
+            next_page = 1
+        self.set_kv("missing_page", str(next_page))
+
         log.info(
-            "Missing list refreshed: %d album(s) cached, order=%s, total_missing=%d",
-            len(self.missing_cache), SEARCH_ORDER, total,
+            "Missing page refreshed: page=%d/%d cached=%d album(s), order=%s, total_missing=%d, next_page=%d, elapsed=%.1fs",
+            page, page_count, len(self.missing_cache), SEARCH_ORDER, total, next_page,
+            time.monotonic() - started,
         )
+        if missing_artist_dates:
+            log.debug(
+                "%d record(s) lacked embedded artist-added dates; tie-breaking by artist/album id",
+                missing_artist_dates,
+            )
 
     def cooldown_ids(self) -> set[int]:
         if ALBUM_COOLDOWN_HOURS <= 0:
@@ -331,7 +359,7 @@ class Scheduler:
     def fetch_missing_candidates(self, limit: int) -> tuple[list[int], int]:
         """Return the next eligible albums from the cached, ordered missing list."""
         cache_age = time.time() - self.missing_cache_time
-        if not self.missing_cache or cache_age > MISSING_REFRESH_MINUTES * 60:
+        if self.missing_cache_time == 0 or cache_age > MISSING_REFRESH_MINUTES * 60:
             self.refresh_missing_cache()
 
         on_cooldown = self.cooldown_ids()
@@ -768,7 +796,8 @@ class Scheduler:
             except requests.RequestException as exc:
                 log.error("Lidarr API request failed: %s", exc)
                 self.reset_indexers("after API error")
-                delay = IDLE_RETRY_SECONDS
+                # Avoid hammering Lidarr every few minutes when a heavy request fails.
+                delay = max(IDLE_RETRY_SECONDS, 1800)
             except Exception:
                 log.exception("Unexpected scheduler error")
                 self.reset_indexers("after scheduler error")
