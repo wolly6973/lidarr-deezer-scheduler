@@ -11,7 +11,24 @@ class MissingCacheRefreshTests(unittest.TestCase):
         instance.db = sqlite3.connect(":memory:")
         instance.db.row_factory = sqlite3.Row
         instance.db.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)")
-        instance.db.execute("CREATE TABLE album_state (album_id INTEGER PRIMARY KEY, last_search INTEGER)")
+        instance.db.execute("""
+            CREATE TABLE album_state (
+                album_id INTEGER PRIMARY KEY,
+                last_search INTEGER,
+                search_count INTEGER NOT NULL DEFAULT 0,
+                last_result TEXT,
+                last_success INTEGER
+            )
+        """)
+        instance.db.execute("""
+            CREATE TABLE search_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                album_id INTEGER NOT NULL,
+                searched_at INTEGER NOT NULL,
+                command_id INTEGER,
+                result TEXT
+            )
+        """)
         instance.db.commit()
         instance.missing_cache = []
         instance.missing_total = 0
@@ -82,6 +99,16 @@ class MissingCacheRefreshTests(unittest.TestCase):
             params={"page": 3, "pageSize": 2, "sortKey": "title", "sortDirection": "ascending"},
             timeout=90,
         )
+ 
+    def test_search_start_persists_page_progress_and_removes_attempted_ids(self):
+        instance = self.make_scheduler()
+        instance.missing_cache = [3, 4, 5]
+        instance.set_kv("missing_page_seen", "[]")
+
+        instance.record_search_start([3, 4], 123)
+
+        self.assertEqual(instance.missing_cache, [5])
+        self.assertEqual(__import__("json").loads(instance.get_kv("missing_page_seen")), [3, 4])
 
 
 if __name__ == "__main__":
