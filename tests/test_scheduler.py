@@ -18,7 +18,7 @@ class MissingCacheRefreshTests(unittest.TestCase):
         instance.missing_cache_time = 0.0
         return instance
 
-    def test_fetches_one_page_and_persists_rotating_cursor(self):
+    def test_fetches_one_page_and_keeps_current_cursor(self):
         instance = self.make_scheduler()
         instance.set_kv("missing_page", "2")
         instance.get_json = Mock(return_value={
