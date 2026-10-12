@@ -39,7 +39,7 @@ class MissingCacheRefreshTests(unittest.TestCase):
         )
         self.assertEqual(instance.missing_cache, [4, 3])
         self.assertEqual(instance.missing_total, 5)
-        self.assertEqual(instance.get_kv("missing_page"), "3")
+        self.assertEqual(instance.get_kv("missing_page"), "2")
         self.assertGreater(instance.missing_cache_time, 0)
 
     def test_wraps_cursor_after_last_page(self):
@@ -50,9 +50,38 @@ class MissingCacheRefreshTests(unittest.TestCase):
         with patch.object(scheduler, "MISSING_PAGE_SIZE", 2), patch.object(scheduler, "SEARCH_ORDER", "random"):
             instance.refresh_missing_cache()
 
-        self.assertEqual(instance.get_kv("missing_page"), "1")
+        self.assertEqual(instance.get_kv("missing_page"), "3")
         self.assertEqual(instance.missing_cache, [5])
         instance.get_json.assert_called_once()
+
+    def test_advances_only_after_cached_page_is_exhausted(self):
+        instance = self.make_scheduler()
+        instance.set_kv("missing_page", "2")
+        now = scheduler.time.time()
+        instance.db.executemany(
+            "INSERT INTO album_state(album_id, last_search) VALUES (?, ?)",
+            [(3, int(now)), (4, int(now))],
+        )
+        instance.db.commit()
+        instance.missing_cache = [3, 4]
+        instance.missing_total = 5
+        instance.missing_cache_time = now - 360 * 60 - 10
+        instance.get_json = Mock(return_value={
+            "totalRecords": 5,
+            "records": [{"id": 5, "artistId": 30, "artist": {"id": 30, "added": "2025-01-01T00:00:00Z"}}],
+        })
+
+        with patch.object(scheduler, "MISSING_PAGE_SIZE", 2), patch.object(scheduler, "MISSING_REFRESH_MINUTES", 360), patch.object(scheduler, "SEARCH_ORDER", "newest_artist"):
+            candidates, total = instance.fetch_missing_candidates(1)
+
+        self.assertEqual(candidates, [5])
+        self.assertEqual(total, 5)
+        self.assertEqual(instance.get_kv("missing_page"), "3")
+        instance.get_json.assert_called_once_with(
+            "wanted/missing",
+            params={"page": 3, "pageSize": 2, "sortKey": "title", "sortDirection": "ascending"},
+            timeout=90,
+        )
 
 
 if __name__ == "__main__":
