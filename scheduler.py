@@ -133,6 +133,12 @@ class Scheduler:
             response = self.session.get(url, params=params, timeout=timeout)
             response.raise_for_status()
             return response.json()
+        except requests.RequestException as exc:
+            log.warning(
+                "Lidarr GET %s failed after %.1fs (timeout=%ss): %s",
+                path, time.monotonic() - started, timeout, exc,
+            )
+            raise
         finally:
             log.debug("Lidarr GET %s completed in %.2fs", path, time.monotonic() - started)
 
@@ -832,12 +838,13 @@ class Scheduler:
                 delay = self.run_once()
             except requests.RequestException as exc:
                 log.error("Lidarr API request failed: %s", exc)
-                self.reset_indexers("after API error")
+                # Indexer changes are always restored in run_search's finally block. Errors
+                # before a search do not need another set of API calls just to reset them.
                 # Avoid hammering Lidarr every few minutes when a heavy request fails.
                 delay = max(IDLE_RETRY_SECONDS, 1800)
             except Exception:
                 log.exception("Unexpected scheduler error")
-                self.reset_indexers("after scheduler error")
+                # run_search restores indexers in its finally block if a search was underway.
                 delay = IDLE_RETRY_SECONDS
 
             log.info("Scheduler sleeping for %d seconds", delay)
