@@ -154,7 +154,7 @@ def status(s):
 def start_webui(scheduler):
  DATA.mkdir(parents=True,exist_ok=True); root=logging.getLogger(); root.addHandler(ring)
  fh=logging.FileHandler(LOG_FILE,encoding="utf-8"); fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")); root.addHandler(fh)
- if not PASSWORD_FILE.exists(): PASSWORD_FILE.write_text(secrets.token_urlsafe(18)+"\n"); PASSWORD_FILE.chmod(0o600); logging.warning("Web UI password created at %s; username admin",PASSWORD_FILE)
+ if not PASSWORD_FILE.exists(): PASSWORD_FILE.write_text(secrets.token_urlsafe(18)+"\n"); PASSWORD_FILE.chmod(0o600); logging.warning("Web UI password created at %s",PASSWORD_FILE)
  saved={}
  try: saved=json.loads(SETTINGS_FILE.read_text())
  except (OSError,ValueError): pass
