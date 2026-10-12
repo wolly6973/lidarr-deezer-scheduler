@@ -132,7 +132,7 @@ Notes on ranges:
 
 The built-in *arr-inspired web UI provides a dashboard, editable scheduler settings, searchable logs, and a confirmed safety-pause reset.
 
-- Open `http://<docker-host>:8080/` after rebuilding and redeploying the image. Change the host port with `WEBUI_HOST_PORT` (default `8080`).
+- Open `http://<docker-host>:8081/` after rebuilding and redeploying the image. Change the host port with `WEBUI_HOST_PORT` (default `8081`).
 - The default username is `admin`; set `WEBUI_USERNAME` to change it.
 - On first start, a random password is written to `/data/webui_password`. Retrieve it with `docker exec lidarr-deezer-scheduler cat /data/webui_password`.
 - Settings persist in `/data/webui-settings.json`; logs are written to `/data/scheduler.log`. Keep the existing `scheduler-data` volume.
