@@ -128,6 +128,17 @@ Notes on ranges:
 - If `MIN_SEARCHES_PER_DAY` is larger than the max, it is lowered to the max.
 - If you set both download values and write them backwards, they are swapped. If you leave `MIN_DOWNLOADS_PER_DAY` unset, it never exceeds the max.
 
+## Web UI
+
+The built-in *arr-inspired web UI provides a dashboard, editable scheduler settings, searchable logs, and a confirmed safety-pause reset.
+
+- Open `http://<docker-host>:8080/` after rebuilding and redeploying the image. Change the host port with `WEBUI_HOST_PORT` (default `8080`).
+- The default username is `admin`; set `WEBUI_USERNAME` to change it.
+- On first start, a random password is written to `/data/webui_password`. Retrieve it with `docker exec lidarr-deezer-scheduler cat /data/webui_password`.
+- Settings persist in `/data/webui-settings.json`; logs are written to `/data/scheduler.log`. Keep the existing `scheduler-data` volume.
+- Reset clears the active pause and ignores failures recorded before reset time. It does not disable safety checks or clear history, cooldowns, or daily caps.
+- Keep the UI on a trusted network. Use HTTPS through a reverse proxy for remote access; do not expose the HTTP port directly to the internet.
+
 ## Reading the logs
 
 ```
