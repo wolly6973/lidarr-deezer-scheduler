@@ -4,10 +4,14 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+from zoneinfo import ZoneInfo
 
 DATA=Path(os.getenv("DB_PATH","/data/scheduler.db")).parent
 SETTINGS_FILE=DATA/"webui-settings.json"; PASSWORD_FILE=DATA/"webui_password"; LOG_FILE=DATA/"scheduler.log"
 FIELDS={
+"LIDARR_URL":("Lidarr URL","str",1,500),"LIDARR_API_KEY":("Lidarr API key (leave blank to keep current key)","secret",0,500),
+"TZ":("Time zone (IANA name)","str",1,100),"LOG_LEVEL":("Log level","choice",["DEBUG","INFO","WARNING","ERROR","CRITICAL"],None),
+"WEBUI_USERNAME":("Web UI username","str",1,100),
 "BATCH_SIZE":("Albums per search batch","int",1,100),"MIN_SEARCHES_PER_DAY":("Minimum searches per day","int",1,100000),
 "MAX_SEARCHES_PER_DAY":("Maximum searches per day","int",1,100000),"MIN_DOWNLOADS_PER_DAY":("Minimum grabs per day","int",0,100000),
 "MAX_DOWNLOADS_PER_DAY":("Maximum grabs per day (0 = unlimited)","int",0,100000),
@@ -20,19 +24,27 @@ FIELDS={
 "SAFETY_CHECK_ENABLED":("Enable safety checks","bool",None,None),"DEEZER_DOWNLOAD_CLIENT_NAME":("Deezer download client (optional)","str",0,200),
 "FAIL_LOOKBACK_HOURS":("Failure lookback (hours)","float",1,720),"FAIL_MIN_FAILURES":("Minimum failures to pause","int",1,10000),
 "FAIL_RATIO":("Failure ratio (0–1)","float",0,1),"FAIL_PAUSE_HOURS":("Safety pause duration (hours)","float",0.5,720)}
+AUTH_USERNAME=os.getenv("WEBUI_USERNAME","admin")
 BOOLS={k for k,v in FIELDS.items() if v[1]=="bool"}
 def mod(): return sys.modules.get("scheduler") or sys.modules.get("__main__")
-def current():
+def current(include_secrets=False):
  d={}
  for k,(label,kind,lo,hi) in FIELDS.items():
-  v=getattr(mod(),k)
-  d[k]=", ".join(sorted(v)) if k=="OTHER_INDEXERS_EXCLUDE" else v
+  if k=="LIDARR_API_KEY":
+   d[k]=getattr(mod(),"LIDARR_API_KEY","") if include_secrets else ""
+  elif k=="WEBUI_USERNAME":
+   d[k]=AUTH_USERNAME
+  else:
+   v=getattr(mod(),k)
+   d[k]=", ".join(sorted(v)) if k=="OTHER_INDEXERS_EXCLUDE" else v
  return d
+
 def apply(values,persist=True):
+ global AUTH_USERNAME
  if not isinstance(values,dict): raise ValueError("Settings must be an object")
  unknown=set(values)-set(FIELDS)
  if unknown: raise ValueError("Unknown settings: "+", ".join(sorted(unknown)))
- clean=current()
+ clean=current(True)
  for k,raw in values.items():
   label,kind,lo,hi=FIELDS[k]
   if kind=="bool":
@@ -41,6 +53,11 @@ def apply(values,persist=True):
   elif kind=="choice":
    if raw not in lo: raise ValueError(label+" has an invalid choice")
    v=raw
+  elif kind=="secret":
+   if not isinstance(raw,str): raise ValueError(label+" must be text")
+   v=raw.strip() or getattr(mod(),"LIDARR_API_KEY","")
+   if not v: raise ValueError("Enter your Lidarr API key before saving settings")
+   if len(v)>hi: raise ValueError(label+" is too long")
   elif kind=="str":
    if not isinstance(raw,str): raise ValueError(label+" must be text")
    v=raw.strip()
@@ -55,11 +72,28 @@ def apply(values,persist=True):
  if clean["MIN_SEARCHES_PER_DAY"]>clean["MAX_SEARCHES_PER_DAY"]: raise ValueError("Minimum searches cannot exceed maximum")
  if clean["MAX_DOWNLOADS_PER_DAY"]>0 and clean["MIN_DOWNLOADS_PER_DAY"]>clean["MAX_DOWNLOADS_PER_DAY"]: raise ValueError("Minimum grabs cannot exceed maximum")
  if clean["MIN_CHUNK_DELAY_SECONDS"]>clean["MAX_CHUNK_DELAY_SECONDS"]: raise ValueError("Minimum delay cannot exceed maximum")
- for k,v in clean.items(): setattr(mod(),k,{n.strip().lower() for n in v.split(",") if n.strip()} if k=="OTHER_INDEXERS_EXCLUDE" else v)
+ parsed=urlparse(clean["LIDARR_URL"])
+ if parsed.scheme not in ("http","https") or not parsed.netloc: raise ValueError("Lidarr URL must start with http:// or https:// and include a host")
+ try: ZoneInfo(clean["TZ"])
+ except Exception: raise ValueError("Use a valid IANA time zone, such as America/Chicago")
+ for k,v in clean.items():
+  if k=="LIDARR_API_KEY": setattr(mod(),k,v)
+  elif k=="WEBUI_USERNAME": AUTH_USERNAME=v
+  else: setattr(mod(),k,{n.strip().lower() for n in v.split(",") if n.strip()} if k=="OTHER_INDEXERS_EXCLUDE" else v)
+ mod().LIDARR_URL=clean["LIDARR_URL"].rstrip("/")
+ mod().LOG_LEVEL=clean["LOG_LEVEL"]
+ mod().log.setLevel(getattr(logging,clean["LOG_LEVEL"]))
+ logging.getLogger().setLevel(getattr(logging,clean["LOG_LEVEL"]))
+ os.environ["TZ"]=clean["TZ"]
+ if hasattr(time,"tzset"): time.tzset()
+ if hasattr(apply,"scheduler") and apply.scheduler is not None:
+  apply.scheduler.session.headers.update({"X-Api-Key":clean["LIDARR_API_KEY"]})
  if persist:
   DATA.mkdir(parents=True,exist_ok=True); SETTINGS_FILE.write_text(json.dumps(clean,indent=2)+"\n"); SETTINGS_FILE.chmod(0o600)
  logging.getLogger(__name__).info("Web UI saved %d settings",len(values))
- return clean
+ return current()
+apply.scheduler=None
+
 HTML=r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lidarr Deezer Scheduler</title><style>
 :root{color-scheme:dark;--bg:#17191d;--panel:#22252b;--line:#3b414b;--text:#e8eaf0;--muted:#a4adba;--accent:#f28c28;--green:#56bd82;--red:#ed7777;--yellow:#e9c45d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,Segoe UI,sans-serif}.top{background:#101114;border-bottom:3px solid var(--accent);padding:15px 22px;font-size:18px;font-weight:750}.top b{color:var(--accent)}.layout{display:grid;grid-template-columns:200px 1fr;min-height:calc(100vh - 55px)}aside{background:#1d2025;border-right:1px solid var(--line);padding:14px}nav button{display:block;width:100%;text-align:left;margin:4px 0;background:transparent;border:0;padding:11px;color:var(--muted)}nav button.active,nav button:hover{background:#34302a;color:white;border-left:3px solid var(--accent)}main{padding:24px;max-width:1500px;width:100%;margin:auto}.head{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:18px}.head h1{font-size:24px;font-weight:550;margin:0}.muted{color:var(--muted)}.spacer{flex:1}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.card{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:16px;margin-bottom:14px;min-width:0}.stat small{display:block;color:var(--muted)}.stat strong{display:block;font-size:27px;margin:5px 0}.btn{padding:8px 12px;border-radius:4px;border:1px solid var(--line);background:#30343b;color:var(--text);cursor:pointer}.primary{background:var(--accent);color:#191919;border-color:var(--accent);font-weight:700}.danger{color:#ffaaaa;border-color:#8d4545}.hidden{display:none!important}.groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.field{display:grid;grid-template-columns:1fr minmax(130px,42%);gap:12px;align-items:center;padding:11px 0;border-bottom:1px solid #343941}.field:last-child{border:0}.field small{display:block;color:var(--muted);font-size:11px}.field input,.field select{width:100%;padding:8px;background:#17191d;border:1px solid #454b55;border-radius:4px;color:var(--text)}.field input[type=checkbox]{width:18px;accent-color:var(--accent)}.logpane{height:60vh;overflow:auto;background:#101114;border:1px solid var(--line);padding:12px;font:12px/1.7 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.INFO{color:#bdc7d5}.WARNING{color:var(--yellow)}.ERROR,.CRITICAL{color:#ff8585}.DEBUG{color:#8db2df}.notice{padding:12px;background:#302a1c;border:1px solid #67552a;margin-bottom:14px}.ok{color:var(--green)}.bad{color:var(--red)}.actions{display:flex;gap:8px;flex-wrap:wrap}@media(max-width:850px){.layout{grid-template-columns:1fr}nav{display:flex;overflow:auto}nav button{white-space:nowrap;width:auto}.groups{grid-template-columns:1fr}main{padding:14px}}@media(max-width:520px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.field{grid-template-columns:1fr}.top{padding:12px}}</style></head><body>
 <header class="top"><b>♪</b> Lidarr Deezer Scheduler <span class="muted">/ Web UI</span></header><div class="layout"><aside><nav><button class="active" data-tab="dashboard">▦ &nbsp; Dashboard</button><button data-tab="settings">⚙ &nbsp; Settings</button><button data-tab="logs">≡ &nbsp; Logs</button><button data-tab="safety">⛨ &nbsp; Safety & Recovery</button><button data-tab="about">ⓘ &nbsp; About</button></nav></aside><main>
@@ -126,12 +160,15 @@ def start_webui(scheduler):
  if saved:
   try: apply(saved,False)
   except Exception: logging.exception("Saved Web UI settings invalid; using environment defaults")
- password=PASSWORD_FILE.read_text().strip(); username=os.getenv("WEBUI_USERNAME","admin")
+ apply.scheduler=scheduler
+ if getattr(scheduler,"session",None) is not None:
+  scheduler.session.headers.update({"X-Api-Key":getattr(mod(),"LIDARR_API_KEY","")})
+ password=PASSWORD_FILE.read_text().strip()
  class Handler(BaseHTTPRequestHandler):
   server_version="DeezerSchedulerUI/1.0"
   def log_message(self,fmt,*args): logging.getLogger(__name__).debug(fmt,*args)
   def auth(self):
-   expected="Basic "+base64.b64encode((username+":"+password).encode()).decode()
+   expected="Basic "+base64.b64encode((AUTH_USERNAME+":"+password).encode()).decode()
    if secrets.compare_digest(self.headers.get("Authorization",""),expected): return True
    self.send_response(401);self.send_header("WWW-Authenticate",'Basic realm="Lidarr Deezer Scheduler"');self.send_header("Content-Length","0");self.end_headers();return False
   def send(self,code,data,ctype="application/json; charset=utf-8"):
@@ -148,7 +185,7 @@ def start_webui(scheduler):
    if u.path=="/api/status":
     try:return self.send(200,status(scheduler))
     except Exception:logging.exception("Status failed");return self.send(500,{"error":"Could not load scheduler status"})
-   if u.path=="/api/settings": return self.send(200,{"settings":current(),"labels":{k:v[0] for k,v in FIELDS.items()},"types":{k:v[1] for k,v in FIELDS.items()}})
+   if u.path=="/api/settings": return self.send(200,{"settings":current(),"labels":{k:v[0] for k,v in FIELDS.items()},"types":{k:v[1] for k,v in FIELDS.items()},"key_configured":bool(getattr(mod(),"LIDARR_API_KEY",""))})
    if u.path=="/api/logs":
     q=parse_qs(u.query);level=q.get("level",["ALL"])[0].upper();needle=q.get("q",[""])[0];limit=q.get("limit",["300"])[0]
     if level not in {"ALL","DEBUG","INFO","WARNING","ERROR","CRITICAL"}: return self.send(400,{"error":"Invalid log level"})
@@ -174,7 +211,7 @@ def start_webui(scheduler):
    except Exception as e:return self.send(400,{"error":str(e)})
    u=urlparse(self.path)
    if u.path=="/api/settings":
-    try:return self.send(200,{"ok":True,"settings":apply(body.get("settings",{}))})
+    try: apply(body.get("settings",{})); return self.send(200,{"ok":True,"settings":current()})
     except ValueError as e:return self.send(400,{"error":str(e)})
     except Exception:logging.exception("Settings update failed");return self.send(500,{"error":"Unable to save settings"})
    if u.path=="/api/safety/reset":
@@ -189,4 +226,4 @@ def start_webui(scheduler):
     except Exception:logging.exception("Pause reset failed");return self.send(500,{"error":"Could not reset safety pause"})
    return self.send(404,{"error":"Not found"})
  server=ThreadingHTTPServer((os.getenv("WEBUI_HOST","0.0.0.0"),int(os.getenv("WEBUI_PORT","8080"))),Handler);server.daemon_threads=True
- threading.Thread(target=server.serve_forever,daemon=True,name="webui").start();logging.info("Web UI listening on port %s (username %s)",os.getenv("WEBUI_PORT","8080"),username);return server
+ threading.Thread(target=server.serve_forever,daemon=True,name="webui").start();logging.info("Web UI listening on port %s (username %s)",os.getenv("WEBUI_PORT","8080"),AUTH_USERNAME);return server
