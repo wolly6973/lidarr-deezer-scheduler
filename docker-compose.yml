@@ -6,9 +6,9 @@ services:
     ports:
       - "${WEBUI_HOST_PORT:-8081}:8080"
     environment:
-      # Required
-      LIDARR_URL: "${LIDARR_URL}"
-      LIDARR_API_KEY: "${LIDARR_API_KEY}"
+      # Optional legacy/bootstrap values. The Web UI saves configuration to /data.
+      LIDARR_URL: "${LIDARR_URL:-}"
+      LIDARR_API_KEY: "${LIDARR_API_KEY:-}"
       TZ: "${TZ:-America/Chicago}"
 
       # Daily caps (a random value in each range is picked every local day)
