@@ -470,7 +470,7 @@ class Scheduler:
             attempted = set(album_ids)
             self.missing_cache = [album_id for album_id in self.missing_cache if album_id not in attempted]
 
-    def record_search_result(self, album_ids: list[int], command_id: int, result: str, success: bool) -> None
+    def record_search_result(self, album_ids: list[int], command_id: int, result: str, success: bool) -> None:
         now = self.now()
         self.db.executemany(
             "UPDATE search_events SET result = ? WHERE command_id = ? AND album_id = ?",
