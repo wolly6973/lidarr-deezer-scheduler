@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import unittest
 from unittest.mock import Mock, patch
@@ -108,7 +109,7 @@ class MissingCacheRefreshTests(unittest.TestCase):
         instance.record_search_start([3, 4], 123)
 
         self.assertEqual(instance.missing_cache, [5])
-        self.assertEqual(__import__("json").loads(instance.get_kv("missing_page_seen")), [3, 4])
+        self.assertEqual(json.loads(instance.get_kv("missing_page_seen")), [3, 4])
 
 
 if __name__ == "__main__":
