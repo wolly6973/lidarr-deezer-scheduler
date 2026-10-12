@@ -372,18 +372,21 @@ class Scheduler:
         # This avoids throwing away most of a 500-item page every six hours.
         if (
             not candidates
-            and self.missing_total > 0
             and self.missing_cache_time > 0
             and cache_age >= MISSING_REFRESH_MINUTES * 60
         ):
-            page = max(1, int(self.get_kv("missing_page") or "1"))
-            page_count = max(1, (self.missing_total + MISSING_PAGE_SIZE - 1) // MISSING_PAGE_SIZE)
-            next_page = page + 1 if page < page_count else 1
-            self.set_kv("missing_page", str(next_page))
+            if self.missing_total > 0:
+                page = max(1, int(self.get_kv("missing_page") or "1"))
+                page_count = max(1, (self.missing_total + MISSING_PAGE_SIZE - 1) // MISSING_PAGE_SIZE)
+                next_page = page + 1 if page < page_count else 1
+                self.set_kv("missing_page", str(next_page))
+                log.info("Missing page %d exhausted; rotating to page %d/%d", page, next_page, page_count)
+            else:
+                # An empty library still needs an occasional refresh to discover new gaps.
+                log.info("No missing albums reported; refreshing the missing list after the idle interval")
+
             self.missing_cache = []
             self.missing_cache_time = 0.0
-            log.info("Missing page %d exhausted; rotating to page %d/%d", page, next_page, page_count)
-
             # Fetch at most one new page in this cycle, even if it contains only cooldown albums.
             self.refresh_missing_cache()
             on_cooldown = self.cooldown_ids()
