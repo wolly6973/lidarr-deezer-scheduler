@@ -96,6 +96,7 @@ class Ring(logging.Handler):
   rows=[x for x in rows if (level=="ALL" or x["level"]==level) and q.lower() in x["message"].lower()]
   return rows[-max(1,min(int(limit),1000)):]
 ring=Ring(); ring.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+_grab_cache={"at":0.0,"value":None}; _grab_cache_lock=threading.Lock()
 def status(s):
  now=int(time.time()); db=sqlite3.connect(os.getenv("DB_PATH","/data/scheduler.db"),timeout=10); db.row_factory=sqlite3.Row
  try:
@@ -109,7 +110,11 @@ def status(s):
  finally: db.close()
  grabs=None
  if getattr(mod(),"MAX_DOWNLOADS_PER_DAY",30)>0:
-  grabs=getattr(s,"deezer_grabs_today")()
+  with _grab_cache_lock:
+   if time.time()-_grab_cache["at"]>=30:
+    try: _grab_cache["value"]=s.deezer_grabs_today(); _grab_cache["at"]=time.time()
+    except Exception: logging.getLogger(__name__).debug("Could not refresh today's Deezer grab count",exc_info=True)
+   grabs=_grab_cache["value"]
  return {"state":"paused" if paused>now else "running","paused_until":paused if paused>now else 0,"pause_remaining":max(0,paused-now),"searches_today":searches,"search_cap":sc,"grabs_today":grabs,"grab_cap":gc,"tracked_albums":tracked,"total_search_events":events,"last_search":last,"missing_total":getattr(s,"missing_total",0),"safety_enabled":getattr(mod(),"SAFETY_CHECK_ENABLED",True),"lidarr_url":getattr(mod(),"LIDARR_URL","")}
 def start_webui(scheduler):
  DATA.mkdir(parents=True,exist_ok=True); root=logging.getLogger(); root.addHandler(ring)
