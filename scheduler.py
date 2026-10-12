@@ -301,6 +301,7 @@ class Scheduler:
         entries: list[tuple[int, int, float]] = []  # (album_id, artist_id, artist_added)
         seen: set[int] = set()
         missing_artist_dates = 0
+        page_seen = {int(value) for value in json.loads(self.get_kv("missing_page_seen") or "[]")}
         for record in records:
             album_id = record.get("id")
             if album_id is None:
@@ -308,7 +309,7 @@ class Scheduler:
             if album_id is None:
                 continue
             album_id = int(album_id)
-            if album_id in seen:
+            if album_id in seen or album_id in page_seen:
                 continue
             seen.add(album_id)
             artist = record.get("artist") or {}
@@ -332,9 +333,12 @@ class Scheduler:
         self.missing_cache_time = time.time()
 
         page_count = max(1, (total + MISSING_PAGE_SIZE - 1) // MISSING_PAGE_SIZE)
+        if total == 0:
+            self.set_kv("missing_page_seen", "[]")
         if not records and page > page_count:
             # The missing list shrank since the cursor was saved. Restart at page 1.
             self.set_kv("missing_page", "1")
+            self.set_kv("missing_page_seen", "[]")
             if total > 0:
                 self.missing_cache_time = 0.0
                 return self.refresh_missing_cache()
@@ -380,6 +384,7 @@ class Scheduler:
                 page_count = max(1, (self.missing_total + MISSING_PAGE_SIZE - 1) // MISSING_PAGE_SIZE)
                 next_page = page + 1 if page < page_count else 1
                 self.set_kv("missing_page", str(next_page))
+                self.set_kv("missing_page_seen", "[]")
                 log.info("Missing page %d exhausted; rotating to page %d/%d", page, next_page, page_count)
             else:
                 # An empty library still needs an occasional refresh to discover new gaps.
@@ -450,8 +455,16 @@ class Scheduler:
                 (album_id, now, "started"),
             )
         self.db.commit()
+        # Persist IDs attempted on this page so a restart or cooldown expiry cannot loop back
+        # to the same albums before the page has been consumed.
+        page_seen = {int(value) for value in json.loads(self.get_kv("missing_page_seen") or "[]")}
+        page_seen.update(int(album_id) for album_id in album_ids)
+        self.set_kv("missing_page_seen", json.dumps(sorted(page_seen)))
+        if self.missing_cache:
+            attempted = set(album_ids)
+            self.missing_cache = [album_id for album_id in self.missing_cache if album_id not in attempted]
 
-    def record_search_result(self, album_ids: list[int], command_id: int, result: str, success: bool) -> None:
+    def record_search_result(self, album_ids: list[int], command_id: int, result: str, success: bool) -> None
         now = self.now()
         self.db.executemany(
             "UPDATE search_events SET result = ? WHERE command_id = ? AND album_id = ?",
