@@ -4,6 +4,7 @@ import os
 import random
 import re
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -80,6 +81,7 @@ class Scheduler:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self._init_db()
+        self.counter_reset_event = threading.Event()
         self.missing_cache: list[int] = []
         self.missing_total = 0
         self.missing_cache_time = 0.0
@@ -852,7 +854,9 @@ class Scheduler:
                 delay = IDLE_RETRY_SECONDS
 
             log.info("Scheduler sleeping for %d seconds", delay)
-            time.sleep(delay)
+            if self.counter_reset_event.wait(delay):
+                self.counter_reset_event.clear()
+                log.info("Daily cap counters were reset; resuming scheduler early")
 
 
 if __name__ == "__main__":
