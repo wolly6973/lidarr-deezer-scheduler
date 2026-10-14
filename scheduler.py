@@ -579,8 +579,10 @@ class Scheduler:
         return value
 
     def searches_today(self) -> int:
-        """Albums searched since local midnight."""
+        """Albums searched since local midnight or the most recent manual counter reset."""
         day_start = int(self.local_now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        reset_at = int(self.get_kv("search_count_reset_at") or "0")
+        day_start = max(day_start, reset_at)
         row = self.db.execute(
             "SELECT COUNT(*) AS count FROM search_events WHERE searched_at >= ?",
             (day_start,),
@@ -610,8 +612,10 @@ class Scheduler:
         return value
 
     def deezer_grabs_today(self) -> int:
-        """Count Deezer grabs since local midnight, from Lidarr's history."""
+        """Count Deezer grabs since local midnight or the most recent manual counter reset."""
         day_start = self.local_now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        reset_at = int(self.get_kv("grab_count_reset_at") or "0")
+        day_start = max(day_start, reset_at)
         events = self.recent_history(day_start)
         return sum(
             1 for e in events
