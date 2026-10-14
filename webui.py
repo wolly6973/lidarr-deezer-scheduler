@@ -94,7 +94,7 @@ def apply(values,persist=True):
  return current()
 apply.scheduler=None
 
-HTML=r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lidarr Deezer Scheduler</title><style>
+LOGIN_HTML=r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · Lidarr Deezer Scheduler</title><style>:root{color-scheme:dark;--bg:#17191d;--panel:#22252b;--line:#3b414b;--text:#e8eaf0;--muted:#a4adba;--accent:#f28c28;--red:#ed7777}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,Segoe UI,sans-serif}.login{width:min(420px,calc(100vw - 32px));padding:28px;background:var(--panel);border:1px solid var(--line);border-top:4px solid var(--accent);border-radius:6px;box-shadow:0 18px 50px #0005}h1{font-size:22px;margin:0 0 6px}.muted{color:var(--muted);margin:0 0 24px}label{display:block;margin:14px 0 6px}input{display:block;width:100%;padding:11px;background:#17191d;border:1px solid #454b55;border-radius:4px;color:var(--text);font:inherit}button{width:100%;padding:11px;margin-top:20px;border:1px solid var(--accent);border-radius:4px;background:var(--accent);color:#191919;font:inherit;font-weight:750;cursor:pointer}#error{color:var(--red);min-height:1.5em;margin-top:12px}</style></head><body><form class="login" id="login"><h1>♪ Lidarr Deezer Scheduler</h1><p class="muted">Sign in to manage your scheduler.</p><label for="username">Username</label><input id="username" name="username" autocomplete="username" required autofocus><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required><button id="submit" type="submit">Sign in</button><div id="error" role="alert"></div></form><script>document.getElementById('login').addEventListener('submit',async e=>{e.preventDefault();const b=document.getElementById('submit'),err=document.getElementById('error');b.disabled=true;err.textContent='';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('username').value,password:document.getElementById('password').value})});const d=await r.json();if(!r.ok)throw Error(d.error||'Sign-in failed');location.href='/'}catch(ex){err.textContent=ex.message;document.getElementById('password').focus()}finally{b.disabled=false}});</script></body></html>'''\n\nHTML=r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lidarr Deezer Scheduler</title><style>
 :root{color-scheme:dark;--bg:#17191d;--panel:#22252b;--line:#3b414b;--text:#e8eaf0;--muted:#a4adba;--accent:#f28c28;--green:#56bd82;--red:#ed7777;--yellow:#e9c45d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,Segoe UI,sans-serif}.top{background:#101114;border-bottom:3px solid var(--accent);padding:15px 22px;font-size:18px;font-weight:750}.top b{color:var(--accent)}.layout{display:grid;grid-template-columns:200px 1fr;min-height:calc(100vh - 55px)}aside{background:#1d2025;border-right:1px solid var(--line);padding:14px}nav button{display:block;width:100%;text-align:left;margin:4px 0;background:transparent;border:0;padding:11px;color:var(--muted)}nav button.active,nav button:hover{background:#34302a;color:white;border-left:3px solid var(--accent)}main{padding:24px;max-width:1500px;width:100%;margin:auto}.head{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:18px}.head h1{font-size:24px;font-weight:550;margin:0}.muted{color:var(--muted)}.spacer{flex:1}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.card{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:16px;margin-bottom:14px;min-width:0}.stat small{display:block;color:var(--muted)}.stat strong{display:block;font-size:27px;margin:5px 0}.btn{padding:8px 12px;border-radius:4px;border:1px solid var(--line);background:#30343b;color:var(--text);cursor:pointer}.primary{background:var(--accent);color:#191919;border-color:var(--accent);font-weight:700}.danger{color:#ffaaaa;border-color:#8d4545}.hidden{display:none!important}.groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.field{display:grid;grid-template-columns:1fr minmax(130px,42%);gap:12px;align-items:center;padding:11px 0;border-bottom:1px solid #343941}.field:last-child{border:0}.field small{display:block;color:var(--muted);font-size:11px}.field input,.field select{width:100%;padding:8px;background:#17191d;border:1px solid #454b55;border-radius:4px;color:var(--text)}.field input[type=checkbox]{width:18px;accent-color:var(--accent)}.logpane{height:60vh;overflow:auto;background:#101114;border:1px solid var(--line);padding:12px;font:12px/1.7 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.INFO{color:#bdc7d5}.WARNING{color:var(--yellow)}.ERROR,.CRITICAL{color:#ff8585}.DEBUG{color:#8db2df}.notice{padding:12px;background:#302a1c;border:1px solid #67552a;margin-bottom:14px}.ok{color:var(--green)}.bad{color:var(--red)}.actions{display:flex;gap:8px;flex-wrap:wrap}@media(max-width:850px){.layout{grid-template-columns:1fr}nav{display:flex;overflow:auto}nav button{white-space:nowrap;width:auto}.groups{grid-template-columns:1fr}main{padding:14px}}@media(max-width:520px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.field{grid-template-columns:1fr}.top{padding:12px}}</style></head><body>
 <header class="top"><b>♪</b> Lidarr Deezer Scheduler <span class="muted">/ Web UI</span></header><div class="layout"><aside><nav><button class="active" data-tab="dashboard">▦ &nbsp; Dashboard</button><button data-tab="settings">⚙ &nbsp; Settings</button><button data-tab="logs">≡ &nbsp; Logs</button><button data-tab="safety">⛨ &nbsp; Safety & Recovery</button><button data-tab="about">ⓘ &nbsp; About</button></nav></aside><main>
 <section id="dashboard"><div class="head"><h1>Dashboard</h1><span class="spacer"></span><button class="btn" onclick="refresh()">↻ Refresh</button></div><div id="banner"></div><div class="grid" id="stats"></div><div class="card"><h3>Scheduler overview</h3><div id="overview">Loading…</div></div><div class="card"><h3>Recent activity</h3><div id="recent"></div><button class="btn" onclick="tab('logs')">View all logs →</button></div></section>
@@ -131,6 +131,7 @@ class Ring(logging.Handler):
   rows=[x for x in rows if (level=="ALL" or x["level"]==level) and q.lower() in x["message"].lower()]
   return rows[-max(1,min(int(limit),1000)):]
 ring=Ring(); ring.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+_sessions={}; _sessions_lock=threading.RLock(); _SESSION_TTL=12*3600
 _grab_cache={"at":0.0,"value":None}; _grab_cache_lock=threading.Lock()
 def status(s):
  now=int(time.time()); db=sqlite3.connect(os.getenv("DB_PATH","/data/scheduler.db"),timeout=10); db.row_factory=sqlite3.Row
@@ -172,9 +173,19 @@ def start_webui(scheduler):
   server_version="DeezerSchedulerUI/1.0"
   def log_message(self,fmt,*args): logging.getLogger(__name__).debug(fmt,*args)
   def auth(self):
-   expected="Basic "+base64.b64encode((AUTH_USERNAME+":"+password).encode()).decode()
-   if secrets.compare_digest(self.headers.get("Authorization",""),expected): return True
-   self.send_response(401);self.send_header("WWW-Authenticate",'Basic realm="Lidarr Deezer Scheduler"');self.send_header("Content-Length","0");self.end_headers();return False
+   cookie=self.headers.get("Cookie","")
+   token=""
+   for part in cookie.split(";"):
+    name,sep,value=part.strip().partition("=")
+    if sep and name=="scheduler_session": token=value
+   now=time.time()
+   with _sessions_lock:
+    expiry=_sessions.get(token,0) if token else 0
+    if expiry>now:
+     _sessions[token]=now+_SESSION_TTL
+     return True
+    if token: _sessions.pop(token,None)
+   return False
   def send(self,code,data,ctype="application/json; charset=utf-8"):
    raw=data.encode() if isinstance(data,str) else json.dumps(data).encode()
    self.send_response(code);self.send_header("Content-Type",ctype);self.send_header("Content-Length",str(len(raw)));self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff");self.send_header("Content-Security-Policy","default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'");self.end_headers();self.wfile.write(raw)
@@ -183,9 +194,10 @@ def start_webui(scheduler):
    if n>65536: raise ValueError("Request body too large")
    return json.loads(self.rfile.read(n) or b"{}")
   def do_GET(self):
-   if not self.auth(): return
    u=urlparse(self.path)
-   if u.path=="/": return self.send(200,HTML,"text/html; charset=utf-8")
+   if u.path in ("/","/login") and not self.auth(): return self.send(200,LOGIN_HTML,"text/html; charset=utf-8")
+   if not self.auth(): return self.send(401,{"error":"Login required"})
+   if u.path in ("/","/login"): return self.send(200,HTML,"text/html; charset=utf-8")
    if u.path=="/api/status":
     try:return self.send(200,status(scheduler))
     except Exception:logging.exception("Status failed");return self.send(500,{"error":"Could not load scheduler status"})
@@ -210,10 +222,19 @@ def start_webui(scheduler):
     except Exception as e:return self.send(502,{"ok":False,"message":str(e)[:240]})
    return self.send(404,{"error":"Not found"})
   def do_POST(self):
-   if not self.auth():return
+   u=urlparse(self.path)
    try: body=self.body()
    except Exception as e:return self.send(400,{"error":str(e)})
-   u=urlparse(self.path)
+   if u.path=="/api/login":
+    username=body.get("username","") if isinstance(body,dict) else ""
+    supplied=body.get("password","") if isinstance(body,dict) else ""
+    if not isinstance(username,str) or not isinstance(supplied,str) or not secrets.compare_digest(username,AUTH_USERNAME) or not secrets.compare_digest(supplied,password):
+     return self.send(401,{"error":"Invalid username or password"})
+    token=secrets.token_urlsafe(32)
+    with _sessions_lock: _sessions[token]=time.time()+_SESSION_TTL
+    raw=json.dumps({"ok":True}).encode()
+    self.send_response(200);self.send_header("Content-Type","application/json; charset=utf-8");self.send_header("Content-Length",str(len(raw)));self.send_header("Cache-Control","no-store");self.send_header("Set-Cookie",f"scheduler_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={_SESSION_TTL}");self.send_header("X-Content-Type-Options","nosniff");self.end_headers();self.wfile.write(raw);return
+   if not self.auth():return self.send(401,{"error":"Login required"})
    if u.path=="/api/settings":
     try: apply(body.get("settings",{})); return self.send(200,{"ok":True,"settings":current()})
     except ValueError as e:return self.send(400,{"error":str(e)})
