@@ -630,8 +630,8 @@ class Scheduler:
         try:
             data = self.get_json("history/since", params={"date": iso})
             return data if isinstance(data, list) else []
-        except requests.HTTPError as exc:
-            log.warning("history/since unavailable (%s); falling back to paged history", exc)
+        except requests.RequestException as exc:
+            log.warning("history/since request failed (%s); falling back to paged history", exc)
 
         data = self.get_json(
             "history",
