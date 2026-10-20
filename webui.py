@@ -94,6 +94,7 @@ def apply(values,persist=True):
  if hasattr(time,"tzset"): time.tzset()
  if hasattr(apply,"scheduler") and apply.scheduler is not None:
   apply.scheduler.session.headers.update({"X-Api-Key":clean["LIDARR_API_KEY"]})
+  if hasattr(apply.scheduler,"counter_reset_event"): apply.scheduler.counter_reset_event.set()
  if persist:
   DATA.mkdir(parents=True,exist_ok=True); SETTINGS_FILE.write_text(json.dumps(clean,indent=2)+"\n"); SETTINGS_FILE.chmod(0o600)
  logging.getLogger(__name__).info("Web UI saved %d settings",len(values))
