@@ -1,6 +1,6 @@
 # lidarr-deezer-scheduler
 
-A small Docker service that slowly fills gaps in a large Lidarr library from Deezer (through the Lidarr Deemix plugin) while keeping automated activity on your Deezer account low and irregular.
+A small Docker service that slowly fills gaps in a Lidarr library from Deezer (through the Lidarr Deemix plugin) while keeping automated activity on your Deezer account low and irregular.
 
 It never talks to Deezer directly. It only drives Lidarr's API: it picks missing albums, makes Deezer the only active indexer for a short search, then puts everything back. It is **missing-only** (it does not schedule upgrades) and does not replace Lidarr's normal RSS and new-release workflow.
 
