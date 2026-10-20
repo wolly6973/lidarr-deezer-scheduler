@@ -3,11 +3,16 @@ services:
     build: .
     container_name: lidarr-deezer-scheduler
     restart: unless-stopped
+    ports:
+      - "${WEBUI_HOST_PORT:-8081}:8080"
     environment:
-      # Required
-      LIDARR_URL: "${LIDARR_URL}"
-      LIDARR_API_KEY: "${LIDARR_API_KEY}"
+      # Optional legacy/bootstrap values. The Web UI saves configuration to /data.
+      LIDARR_URL: "${LIDARR_URL:-}"
+      LIDARR_API_KEY: "${LIDARR_API_KEY:-}"
       TZ: "${TZ:-America/Chicago}"
+      SEARCH_WINDOW_ENABLED: "${SEARCH_WINDOW_ENABLED:-true}"
+      SEARCH_WINDOW_START: "${SEARCH_WINDOW_START:-07:00}"
+      SEARCH_WINDOW_END: "${SEARCH_WINDOW_END:-23:00}"
 
       # Daily caps (a random value in each range is picked every local day)
       MIN_SEARCHES_PER_DAY: "${MIN_SEARCHES_PER_DAY:-}"
@@ -43,6 +48,8 @@ services:
       FAIL_PAUSE_HOURS: "${FAIL_PAUSE_HOURS:-12}"
 
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      WEBUI_PORT: "8080"
+      WEBUI_USERNAME: "${WEBUI_USERNAME:-admin}"
     volumes:
       - scheduler-data:/data
 

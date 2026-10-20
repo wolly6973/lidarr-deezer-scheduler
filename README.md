@@ -12,7 +12,7 @@ Each cycle ("chunk") does the following:
 
 1. **Safety check.** Skips the cycle (and sleeps) if a safety pause is active, if Lidarr reports a download client or indexer error for Deezer, or if recent Deezer downloads are failing. See [Safety check](#safety-check).
 2. **Daily caps.** Picks today's random grab cap and search cap (see [Daily caps](#daily-caps)). If either is used up, it sleeps until shortly after local midnight.
-3. **Chooses albums.** Takes the next few monitored, missing albums, ordered by how recently their artist was added to Lidarr (newest first), skipping albums still on cooldown.
+3. **Chooses albums.** Fetches one page of monitored, missing albums from Lidarr. It keeps that page locally until its entries have been searched recently or are already on cooldown, then advances to the next page. This avoids crawling every page repeatedly and avoids throwing away most of a page on a timer. “Newest artist” ordering is applied within the fetched page.
 4. **Swaps indexers.** Turns **Automatic Search off** on every other indexer (the list is saved to the database first) and **on** for Deezer.
 5. **Searches.** Sends one `AlbumSearch` command for the batch and waits for it to finish.
 6. **Restores.** Turns Deezer off and re-enables exactly the indexers it disabled.
@@ -82,51 +82,34 @@ docker logs -f lidarr-deezer-scheduler
 The repository includes `docker-compose.yml` and a `Dockerfile`, so Portainer can deploy the stack straight from Git.
 
 1. Create a Portainer stack from this repository.
-2. Set the environment variables in the stack's *Environment variables* section (see [Configuration](#configuration)).
-3. Point `LIDARR_URL` at your Lidarr's LAN address, for example `http://192.168.1.10:8686`.
-4. Set `LIDARR_API_KEY` to your Lidarr API key. Don't commit it to GitHub.
-5. Deploy. When you update the code later, use **Pull and redeploy** and turn on rebuilding the image, because the compose file uses `build: .`.
+2. Deploy with the `feature/webui` branch (or the branch you intend to use).
+3. Set `WEBUI_HOST_PORT` only if the default host port `8081` is already in use.
+4. Deploy. Open `http://<docker-host>:<host-port>/`, sign in with the generated password, then configure Lidarr and scheduler options under **Settings**.
+5. When updating code, use **Pull and redeploy** and turn on rebuilding the image, because the compose file uses `build: .`.
 
 Search history and state are stored in the `scheduler-data` volume (`/data/scheduler.db`). Keep it between redeploys.
 
 ## Configuration
 
-Every setting is an environment variable. A setting must be listed in `docker-compose.yml` to reach the container; the included file lists all of them.
+**Configure the application in the Web UI.** New installs do not need scheduler environment variables.
 
-| Variable | Default | Description |
+1. Open **Settings** in the Web UI.
+2. Enter the Lidarr base URL (for example, `http://192.168.1.10:8686`) and API key.
+3. Use **Test Lidarr connection** to confirm the URL and key work.
+4. Review the scheduler, indexer-management, timezone, logging, and safety settings, then click **Save changes**.
+
+Settings are applied immediately and saved in `/data/webui-settings.json` with restrictive file permissions. The API key is never sent back to the browser after saving; leave its password field blank to keep the saved key. Keep the existing `scheduler-data` volume when redeploying.
+
+### Docker/Portainer deployment settings
+
+These are deployment-level settings, not scheduler settings:
+
+| Variable | Default | Purpose |
 |---|---|---|
-| `LIDARR_URL` | (required) | Lidarr base URL, e.g. `http://192.168.1.10:8686` |
-| `LIDARR_API_KEY` | (required) | Lidarr API key |
-| `TZ` | `America/Chicago` | Time zone; decides where "midnight" is |
-| `MIN_SEARCHES_PER_DAY` | 70% of max | Low end of the daily search cap range |
-| `MAX_SEARCHES_PER_DAY` | `100` | High end of the daily search cap range |
-| `MIN_DOWNLOADS_PER_DAY` | `10` | Low end of the daily grab cap range |
-| `MAX_DOWNLOADS_PER_DAY` | `30` | High end of the grab cap range; `0` disables the grab cap |
-| `BATCH_SIZE` | `5` | Albums per search command |
-| `MIN_CHUNK_DELAY_SECONDS` | `900` | Shortest wait between chunks |
-| `MAX_CHUNK_DELAY_SECONDS` | `2700` | Longest wait between chunks |
-| `IDLE_RETRY_SECONDS` | `300` | Wait after an error, or when nothing is eligible |
-| `ALBUM_COOLDOWN_HOURS` | `72` | Don't re-search an album within this many hours. Make it longer than one full pass (e.g. `8760`) so each album is tried once per pass |
-| `COMMAND_TIMEOUT_SECONDS` | `600` | How long to wait for one search command |
-| `SEARCH_ORDER` | `newest_artist` | `newest_artist` or `random` |
-| `MISSING_PAGE_SIZE` | `500` | Page size when loading the missing list |
-| `MISSING_REFRESH_MINUTES` | `360` | How often to reload the missing list. A large library can take many minutes to load, so `1440` is reasonable |
-| `DEEZER_INDEXER_NAME` | `Deezer` | Exact name of the Deezer indexer in Lidarr |
-| `MANAGE_DEEZER_AUTOMATIC_SEARCH` | `true` | Toggle Deezer's Automatic Search around each search |
-| `MANAGE_OTHER_INDEXERS` | `true` | Turn off other indexers' Automatic Search during a search |
-| `OTHER_INDEXERS_EXCLUDE` | (empty) | Comma-separated indexer names never to touch |
-| `SAFETY_CHECK_ENABLED` | `true` | Enable the failure and health checks |
-| `DEEZER_DOWNLOAD_CLIENT_NAME` | (empty) | Optional exact name of the download client that handles Deezer, used as a second way to recognize Deezer events |
-| `FAIL_LOOKBACK_HOURS` | `24` | Window for counting failed downloads |
-| `FAIL_MIN_FAILURES` | `3` | Failures needed to trigger a pause |
-| `FAIL_RATIO` | `0.5` | Failures as a share of Deezer grabs needed to trigger a pause |
-| `FAIL_PAUSE_HOURS` | `12` | Length of a safety pause |
-| `LOG_LEVEL` | `INFO` | Python log level |
+| `WEBUI_HOST_PORT` | `8081` | Host port published by Docker; change this if it conflicts with another service |
+| `WEBUI_PORT` | `8080` | Internal container port; normally leave unchanged |
 
-Notes on ranges:
-
-- If `MIN_SEARCHES_PER_DAY` is larger than the max, it is lowered to the max.
-- If you set both download values and write them backwards, they are swapped. If you leave `MIN_DOWNLOADS_PER_DAY` unset, it never exceeds the max.
+For compatibility, the Compose file still accepts the old scheduler environment variables as initial defaults. On startup, the application imports them into persistent Web UI settings if no settings file exists, and upgrades older settings files by filling in the new connection fields. Once `/data/webui-settings.json` has been created, the Web UI settings take precedence. Do not delete the `scheduler-data` volume.
 
 ## Reading the logs
 
@@ -154,7 +137,7 @@ docker exec lidarr-deezer-scheduler python -c "import sqlite3,time;d=sqlite3.con
 
 **Other indexers stuck off.** Restart the container; the startup step restores any indexers it disabled. You can also re-enable Automatic Search on them manually in Lidarr.
 
-**Nothing happens after the first log lines.** On a large library, the first load of the missing list can take many minutes (about 20 for roughly 30,000 albums). Wait for the `Missing list refreshed` line.
+**Lidarr is slow or the scheduler reports API timeouts.** The scheduler fetches one page of missing albums at a time, keeps it until its entries are attempted or on cooldown, and only then advances to another page. The wanted/missing endpoint can still be expensive on very large libraries; that request gets up to 90 seconds and the scheduler waits at least 30 minutes after an API error to avoid repeatedly hammering Lidarr. Look for `Missing page loaded` and `Missing page exhausted` in the logs.
 
 **See how much has been searched:**
 

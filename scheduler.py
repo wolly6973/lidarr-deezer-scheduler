@@ -4,15 +4,17 @@ import os
 import random
 import re
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 import requests
 
 
-LIDARR_URL = os.environ["LIDARR_URL"].rstrip("/")
-LIDARR_API_KEY = os.environ["LIDARR_API_KEY"]
+LIDARR_URL = os.getenv("LIDARR_URL", "").strip().rstrip("/")
+LIDARR_API_KEY = os.getenv("LIDARR_API_KEY", "").strip()
 BATCH_SIZE = max(1, int(os.getenv("BATCH_SIZE", "5")))
 # Daily search cap: each local day a random cap between MIN and MAX is chosen.
 # MIN_SEARCHES_PER_DAY defaults to 70% of the max when not set.
@@ -35,6 +37,10 @@ MANAGE_OTHER_INDEXERS = os.getenv("MANAGE_OTHER_INDEXERS", "true").lower() in {"
 # Comma-separated indexer names that should never be touched.
 OTHER_INDEXERS_EXCLUDE = {n.strip().lower() for n in os.getenv("OTHER_INDEXERS_EXCLUDE", "").split(",") if n.strip()}
 DB_PATH = os.getenv("DB_PATH", "/data/scheduler.db")
+TZ = os.getenv("TZ", "America/Chicago")
+SEARCH_WINDOW_ENABLED = os.getenv("SEARCH_WINDOW_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+SEARCH_WINDOW_START = os.getenv("SEARCH_WINDOW_START", "07:00")
+SEARCH_WINDOW_END = os.getenv("SEARCH_WINDOW_END", "23:00")
 
 # Ordering: "newest_artist" searches albums from the most recently added artists first.
 # "random" picks albums in random order.
@@ -62,8 +68,10 @@ if MAX_DOWNLOADS_PER_DAY > 0 and MIN_DOWNLOADS_PER_DAY > MAX_DOWNLOADS_PER_DAY:
 DEEZER_DOWNLOAD_CLIENT_NAME = os.getenv("DEEZER_DOWNLOAD_CLIENT_NAME", "").strip()
 
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=LOG_LEVEL,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("lidarr-deezer-scheduler")
@@ -77,6 +85,7 @@ class Scheduler:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self._init_db()
+        self.counter_reset_event = threading.Event()
         self.missing_cache: list[int] = []
         self.missing_total = 0
         self.missing_cache_time = 0.0
@@ -109,19 +118,67 @@ class Scheduler:
                 ON search_events(searched_at);
             CREATE INDEX IF NOT EXISTS idx_search_events_album
                 ON search_events(album_id, searched_at);
+
+            CREATE TABLE IF NOT EXISTS search_batches (
+                command_id INTEGER PRIMARY KEY,
+                searched_at INTEGER NOT NULL,
+                album_count INTEGER NOT NULL,
+                completed INTEGER NOT NULL DEFAULT 0,
+                downloads_found INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS imported_track_events (
+                event_id TEXT PRIMARY KEY,
+                imported_at INTEGER NOT NULL,
+                album_id INTEGER
+            );
             """
         )
+        # Backfill historical search batches from the existing per-album search log.
+        # This preserves a useful hit-rate baseline when upgrading an existing database.
+        historical = self.db.execute(
+            """SELECT command_id, MIN(searched_at) AS searched_at,
+                      COUNT(DISTINCT album_id) AS album_count, MAX(result) AS result
+               FROM search_events WHERE command_id IS NOT NULL GROUP BY command_id"""
+        ).fetchall()
+        for row in historical:
+            result = str(row["result"] or "")
+            if "reports downloaded" not in result.lower():
+                continue
+            self.db.execute(
+                """INSERT OR IGNORE INTO search_batches
+                   (command_id, searched_at, album_count, completed, downloads_found)
+                   VALUES (?, ?, ?, 1, ?)""",
+                (int(row["command_id"]), int(row["searched_at"]), int(row["album_count"]),
+                 self.parse_download_count(result)),
+            )
         self.db.commit()
 
     @staticmethod
     def now() -> int:
         return int(time.time())
 
-    def get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    def get_json(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        timeout: int = 30,
+    ) -> Any:
+        """GET a Lidarr resource; allow a longer timeout only for known expensive endpoints."""
         url = f"{LIDARR_URL}/api/v1/{path.lstrip('/')}"
-        response = self.session.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        return response.json()
+        started = time.monotonic()
+        try:
+            response = self.session.get(url, params=params, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as exc:
+            log.warning(
+                "Lidarr GET %s failed after %.1fs (timeout=%ss): %s",
+                path, time.monotonic() - started, timeout, exc,
+            )
+            raise
+        finally:
+            log.debug("Lidarr GET %s completed in %.2fs", path, time.monotonic() - started)
 
     def post_json(self, path: str, payload: dict[str, Any]) -> Any:
         url = f"{LIDARR_URL}/api/v1/{path.lstrip('/')}"
@@ -263,60 +320,82 @@ class Scheduler:
         self.db.commit()
 
     def refresh_missing_cache(self) -> None:
-        """Load all missing albums and order them according to SEARCH_ORDER."""
-        added_by_artist: dict[int, float] = {}
-        if SEARCH_ORDER == "newest_artist":
-            for artist in self.get_json("artist"):
-                if artist.get("id") is not None:
-                    added_by_artist[int(artist["id"])] = self.parse_iso(artist.get("added"))
+        """Fetch the current page of missing albums without crawling the entire library.
 
-        entries: list[tuple[int, int]] = []  # (album_id, artist_id)
+        Lidarr's wanted/missing endpoint performs an expensive count query. Fetching every
+        page repeatedly multiplies that cost by the number of pages, so keep one page cached
+        and persist its page number. Advance only after its entries are exhausted/on cooldown.
+        """
+        page = max(1, int(self.get_kv("missing_page") or "1"))
+        started = time.monotonic()
+        data = self.get_json(
+            "wanted/missing",
+            params={
+                "page": page,
+                "pageSize": MISSING_PAGE_SIZE,
+                "sortKey": "title",
+                "sortDirection": "ascending",
+            },
+            # This endpoint can take longer than ordinary Lidarr API calls on large libraries.
+            timeout=90,
+        )
+        records = data.get("records", []) if isinstance(data, dict) else []
+        total = int(data.get("totalRecords", 0)) if isinstance(data, dict) else 0
+
+        entries: list[tuple[int, int, float]] = []  # (album_id, artist_id, artist_added)
         seen: set[int] = set()
-        page = 1
-        total = 0
-        while True:
-            data = self.get_json(
-                "wanted/missing",
-                params={
-                    "page": page,
-                    "pageSize": MISSING_PAGE_SIZE,
-                    "sortKey": "title",
-                    "sortDirection": "ascending",
-                },
-            )
-            records = data.get("records", [])
-            total = int(data.get("totalRecords", total))
-            for record in records:
-                album_id = record.get("id")
-                if album_id is None:
-                    album_id = record.get("albumId")
-                if album_id is None:
-                    continue
-                album_id = int(album_id)
-                if album_id in seen:
-                    continue
-                seen.add(album_id)
-                artist_id = record.get("artistId")
-                if artist_id is None:
-                    artist_id = (record.get("artist") or {}).get("id", 0)
-                entries.append((album_id, int(artist_id or 0)))
-
-            if not records or len(records) < MISSING_PAGE_SIZE or len(seen) >= total:
-                break
-            page += 1
+        missing_artist_dates = 0
+        page_seen = {int(value) for value in json.loads(self.get_kv("missing_page_seen") or "[]")}
+        for record in records:
+            album_id = record.get("id")
+            if album_id is None:
+                album_id = record.get("albumId")
+            if album_id is None:
+                continue
+            album_id = int(album_id)
+            if album_id in seen or album_id in page_seen:
+                continue
+            seen.add(album_id)
+            artist = record.get("artist") or {}
+            artist_id = record.get("artistId")
+            if artist_id is None:
+                artist_id = artist.get("id", 0)
+            artist_added = self.parse_iso(artist.get("added"))
+            if SEARCH_ORDER == "newest_artist" and not artist_added:
+                missing_artist_dates += 1
+            entries.append((album_id, int(artist_id or 0), artist_added))
 
         if SEARCH_ORDER == "random":
             random.shuffle(entries)
         else:
-            entries.sort(key=lambda e: (-added_by_artist.get(e[1], 0.0), e[1], e[0]))
+            # The API response embeds artist data; use it rather than issuing a separate
+            # full /artist request. Ordering is within this page, not across the whole library.
+            entries.sort(key=lambda e: (-e[2], e[1], e[0]))
 
-        self.missing_cache = [album_id for album_id, _ in entries]
+        self.missing_cache = [album_id for album_id, _, _ in entries]
         self.missing_total = total
         self.missing_cache_time = time.time()
+
+        page_count = max(1, (total + MISSING_PAGE_SIZE - 1) // MISSING_PAGE_SIZE)
+        if total == 0:
+            self.set_kv("missing_page_seen", "[]")
+        if not records and page > page_count:
+            # The missing list shrank since the cursor was saved. Restart at page 1.
+            self.set_kv("missing_page", "1")
+            self.set_kv("missing_page_seen", "[]")
+            if total > 0:
+                self.missing_cache_time = 0.0
+                return self.refresh_missing_cache()
         log.info(
-            "Missing list refreshed: %d album(s) cached, order=%s, total_missing=%d",
-            len(self.missing_cache), SEARCH_ORDER, total,
+            "Missing page loaded: page=%d/%d cached=%d album(s), order=%s, total_missing=%d, elapsed=%.1fs",
+            page, page_count, len(self.missing_cache), SEARCH_ORDER, total,
+            time.monotonic() - started,
         )
+        if missing_artist_dates:
+            log.debug(
+                "%d record(s) lacked embedded artist-added dates; tie-breaking by artist/album id",
+                missing_artist_dates,
+            )
 
     def cooldown_ids(self) -> set[int]:
         if ALBUM_COOLDOWN_HOURS <= 0:
@@ -326,22 +405,47 @@ class Scheduler:
         return {int(row[0]) for row in rows}
 
     def fetch_missing_candidates(self, limit: int) -> tuple[list[int], int]:
-        """Return the next eligible albums from the cached, ordered missing list."""
-        cache_age = time.time() - self.missing_cache_time
-        if not self.missing_cache or cache_age > MISSING_REFRESH_MINUTES * 60:
+        """Return eligible albums from one cached page, rotating only after it is exhausted."""
+        if self.missing_cache_time == 0:
             self.refresh_missing_cache()
 
         on_cooldown = self.cooldown_ids()
-        candidates: list[int] = []
-        for album_id in self.missing_cache:
-            if album_id in on_cooldown:
-                continue
-            candidates.append(album_id)
-            if len(candidates) >= limit:
-                break
+        candidates = [
+            album_id for album_id in self.missing_cache
+            if album_id not in on_cooldown
+        ][:limit]
+        cache_age = time.time() - self.missing_cache_time
+
+        # Keep a page until its albums have been attempted or are already on cooldown.
+        # This avoids throwing away most of a 500-item page every six hours.
+        if (
+            not candidates
+            and self.missing_cache_time > 0
+            and cache_age >= MISSING_REFRESH_MINUTES * 60
+        ):
+            if self.missing_total > 0:
+                page = max(1, int(self.get_kv("missing_page") or "1"))
+                page_count = max(1, (self.missing_total + MISSING_PAGE_SIZE - 1) // MISSING_PAGE_SIZE)
+                next_page = page + 1 if page < page_count else 1
+                self.set_kv("missing_page", str(next_page))
+                self.set_kv("missing_page_seen", "[]")
+                log.info("Missing page %d exhausted; rotating to page %d/%d", page, next_page, page_count)
+            else:
+                # An empty library still needs an occasional refresh to discover new gaps.
+                log.info("No missing albums reported; refreshing the missing list after the idle interval")
+
+            self.missing_cache = []
+            self.missing_cache_time = 0.0
+            # Fetch at most one new page in this cycle, even if it contains only cooldown albums.
+            self.refresh_missing_cache()
+            on_cooldown = self.cooldown_ids()
+            candidates = [
+                album_id for album_id in self.missing_cache
+                if album_id not in on_cooldown
+            ][:limit]
 
         log.info(
-            "Candidate scan: eligible=%d/%d | cached=%d | on cooldown=%d | total_missing=%d",
+            "Candidate scan: eligible=%d/%d | cached_page=%d | on cooldown=%d | total_missing=%d",
             len(candidates), limit, len(self.missing_cache), len(on_cooldown), self.missing_total,
         )
         return candidates, self.missing_total
@@ -395,6 +499,14 @@ class Scheduler:
                 (album_id, now, "started"),
             )
         self.db.commit()
+        # Persist IDs attempted on this page so a restart or cooldown expiry cannot loop back
+        # to the same albums before the page has been consumed.
+        page_seen = {int(value) for value in json.loads(self.get_kv("missing_page_seen") or "[]")}
+        page_seen.update(int(album_id) for album_id in album_ids)
+        self.set_kv("missing_page_seen", json.dumps(sorted(page_seen)))
+        if self.missing_cache:
+            attempted = set(album_ids)
+            self.missing_cache = [album_id for album_id in self.missing_cache if album_id not in attempted]
 
     def record_search_result(self, album_ids: list[int], command_id: int, result: str, success: bool) -> None:
         now = self.now()
@@ -418,6 +530,75 @@ class Scheduler:
         match = re.search(r"(\d+)\s+reports?\s+downloaded", result, re.IGNORECASE)
         return int(match.group(1)) if match else 0
 
+    def refresh_lifetime_track_stats(self) -> None:
+        """Count imported track events for albums the scheduler has searched."""
+        cursor = self.get_kv("lifetime_history_cursor")
+        if cursor is None:
+            # Backfill from the scheduler's earliest recorded search, not from the
+            # whole library's history, so old unrelated imports aren't counted.
+            row = self.db.execute("SELECT MIN(searched_at) AS first_search FROM search_events").fetchone()
+            cursor = str(int(row["first_search"]) - 1 if row["first_search"] is not None else self.now() - 1)
+            self.set_kv("lifetime_history_cursor", cursor)
+        since_ts = float(cursor)
+        try:
+            events = self.recent_history(since_ts)
+        except requests.RequestException as exc:
+            log.warning("Could not refresh lifetime imported-track count: %s", exc)
+            return
+
+        latest = since_ts
+        for event in events:
+            event_ts = self.parse_iso(event.get("date"))
+            latest = max(latest, event_ts)
+            if str(event.get("eventType", "")).lower() != "trackfileimported":
+                continue
+            data = event.get("data") or {}
+            album_value = data.get("albumId", event.get("albumId"))
+            try:
+                album_id = int(album_value)
+            except (TypeError, ValueError):
+                continue
+            first_search = self.db.execute(
+                "SELECT MIN(searched_at) FROM search_events WHERE album_id = ?", (album_id,)
+            ).fetchone()[0]
+            if first_search is None or event_ts < float(first_search):
+                continue
+            event_id = event.get("id")
+            if event_id is None:
+                event_id = "|".join((
+                    str(event.get("date", "")), str(album_id),
+                    str(data.get("trackFileId", "")), str(data.get("path", "")),
+                ))
+            self.db.execute(
+                "INSERT OR IGNORE INTO imported_track_events(event_id, imported_at, album_id) VALUES (?, ?, ?)",
+                (str(event_id), int(event_ts or self.now()), album_id),
+            )
+        # The history request succeeded, so advance the cursor even if there were no
+        # events; otherwise an idle scheduler would repeatedly query the same old range.
+        self.db.commit()
+        self.set_kv("lifetime_history_cursor", str(max(latest, float(self.now())) + 0.001))
+
+    def lifetime_stats(self) -> dict[str, int | float]:
+        searched = int(self.db.execute(
+            "SELECT COUNT(DISTINCT album_id) FROM search_events"
+        ).fetchone()[0])
+        batches = self.db.execute(
+            "SELECT COUNT(*) AS total, SUM(CASE WHEN downloads_found > 0 THEN 1 ELSE 0 END) AS hits "
+            "FROM search_batches WHERE completed = 1"
+        ).fetchone()
+        total_batches = int(batches["total"] or 0)
+        hit_batches = int(batches["hits"] or 0)
+        tracks = int(self.db.execute(
+            "SELECT COUNT(*) FROM imported_track_events"
+        ).fetchone()[0])
+        return {
+            "lifetime_albums_searched": searched,
+            "lifetime_completed_batches": total_batches,
+            "lifetime_hit_batches": hit_batches,
+            "lifetime_hit_rate": round(hit_batches * 100.0 / total_batches, 1) if total_batches else 0.0,
+            "lifetime_tracks_downloaded": tracks,
+        }
+
     def run_search(self, album_ids: list[int]) -> tuple[bool, int]:
         payload = {"name": "AlbumSearch", "albumIds": album_ids}
 
@@ -429,6 +610,11 @@ class Scheduler:
             data = self.post_json("command", payload)
             command_id = int(data["id"])
             self.record_search_start(album_ids, command_id)
+            self.db.execute(
+                "INSERT OR REPLACE INTO search_batches(command_id, searched_at, album_count, completed, downloads_found) VALUES (?, ?, ?, 0, 0)",
+                (command_id, self.now(), len(album_ids)),
+            )
+            self.db.commit()
 
             log.info("Started Lidarr AlbumSearch command %s for %d album(s): %s", command_id, len(album_ids), album_ids)
 
@@ -455,6 +641,11 @@ class Scheduler:
             result = str(result)
             download_count = self.parse_download_count(result) if success else 0
             self.record_search_result(album_ids, command_id, result, success)
+            self.db.execute(
+                "UPDATE search_batches SET completed = ?, downloads_found = ? WHERE command_id = ?",
+                (int(success), self.parse_download_count(result) if success else 0, command_id),
+            )
+            self.db.commit()
 
             if success:
                 log.info("Completed AlbumSearch command %s: %s | downloads initiated: %d", command_id, result, download_count)
@@ -505,8 +696,10 @@ class Scheduler:
         return value
 
     def searches_today(self) -> int:
-        """Albums searched since local midnight."""
+        """Albums searched since local midnight or the most recent manual counter reset."""
         day_start = int(self.local_now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        reset_at = int(self.get_kv("search_count_reset_at") or "0")
+        day_start = max(day_start, reset_at)
         row = self.db.execute(
             "SELECT COUNT(*) AS count FROM search_events WHERE searched_at >= ?",
             (day_start,),
@@ -536,8 +729,10 @@ class Scheduler:
         return value
 
     def deezer_grabs_today(self) -> int:
-        """Count Deezer grabs since local midnight, from Lidarr's history."""
+        """Count Deezer grabs since local midnight or the most recent manual counter reset."""
         day_start = self.local_now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        reset_at = int(self.get_kv("grab_count_reset_at") or "0")
+        day_start = max(day_start, reset_at)
         events = self.recent_history(day_start)
         return sum(
             1 for e in events
@@ -550,8 +745,8 @@ class Scheduler:
         try:
             data = self.get_json("history/since", params={"date": iso})
             return data if isinstance(data, list) else []
-        except requests.HTTPError as exc:
-            log.warning("history/since unavailable (%s); falling back to paged history", exc)
+        except requests.RequestException as exc:
+            log.warning("history/since request failed (%s); falling back to paged history", exc)
 
         data = self.get_json(
             "history",
@@ -655,8 +850,64 @@ class Scheduler:
             )
         return 0
 
+    def search_window_wait(self) -> int | None:
+        """Return seconds until the next allowed window, or None if searching is allowed."""
+        if not SEARCH_WINDOW_ENABLED:
+            return None
+
+        try:
+            start_time = datetime.strptime(SEARCH_WINDOW_START, "%H:%M").time()
+            end_time = datetime.strptime(SEARCH_WINDOW_END, "%H:%M").time()
+            now = datetime.now(ZoneInfo(TZ))
+        except (ValueError, KeyError) as exc:
+            log.error("Invalid search window or timezone: %s", exc)
+            return IDLE_RETRY_SECONDS
+
+        if start_time == end_time:
+            log.error("Search window start and end cannot be identical")
+            return IDLE_RETRY_SECONDS
+
+        current_time = now.time()
+
+        if start_time < end_time:
+            # Same-day window, such as 07:00–23:00.
+            allowed = start_time <= current_time < end_time
+        else:
+            # Overnight window, such as 20:00–06:00.
+            allowed = current_time >= start_time or current_time < end_time
+
+        if allowed:
+            return None
+
+        next_start = now.replace(
+            hour=start_time.hour,
+            minute=start_time.minute,
+            second=0,
+            microsecond=0,
+        )
+        if current_time >= start_time:
+            next_start += timedelta(days=1)
+
+        wait = max(1, int((next_start - now).total_seconds()))
+        log.info(
+            "Outside search window (%s-%s %s); next search window opens in %dh %dm",
+            SEARCH_WINDOW_START,
+            SEARCH_WINDOW_END,
+            TZ,
+            wait // 3600,
+            (wait % 3600) // 60,
+        )
+        return wait
+
     def run_once(self) -> int:
         """Run one small chunk and return how long to wait before the next chunk."""
+        window_wait = self.search_window_wait()
+        if window_wait is not None:
+            return window_wait
+        try:
+            self.refresh_lifetime_track_stats()
+        except Exception:
+            log.exception("Could not update lifetime statistics")
         pause = self.safety_check()
         if pause > 0:
             return pause
@@ -750,10 +1001,11 @@ class Scheduler:
             if MAX_DOWNLOADS_PER_DAY > 0 else "disabled",
         )
         log.info(
-            "Config: batch=%d daily searches=random %d-%d random chunk delay=%d-%ds cooldown=%sh idle retry=%ds manage_deezer_automatic_search=%s",
+            "Config: batch=%d daily searches=random %d-%d random chunk delay=%d-%ds cooldown=%sh idle retry=%ds search_window=%s %s-%s %s manage_deezer_automatic_search=%s",
             BATCH_SIZE, MIN_SEARCHES_PER_DAY, MAX_SEARCHES_PER_DAY,
             MIN_CHUNK_DELAY_SECONDS, MAX_CHUNK_DELAY_SECONDS,
             ALBUM_COOLDOWN_HOURS, IDLE_RETRY_SECONDS,
+            SEARCH_WINDOW_ENABLED, SEARCH_WINDOW_START, SEARCH_WINDOW_END, TZ,
             MANAGE_DEEZER_AUTOMATIC_SEARCH,
         )
 
@@ -764,15 +1016,19 @@ class Scheduler:
                 delay = self.run_once()
             except requests.RequestException as exc:
                 log.error("Lidarr API request failed: %s", exc)
-                self.reset_indexers("after API error")
-                delay = IDLE_RETRY_SECONDS
+                # Indexer changes are always restored in run_search's finally block. Errors
+                # before a search do not need another set of API calls just to reset them.
+                # Avoid hammering Lidarr every few minutes when a heavy request fails.
+                delay = max(IDLE_RETRY_SECONDS, 1800)
             except Exception:
                 log.exception("Unexpected scheduler error")
-                self.reset_indexers("after scheduler error")
+                # run_search restores indexers in its finally block if a search was underway.
                 delay = IDLE_RETRY_SECONDS
 
             log.info("Scheduler sleeping for %d seconds", delay)
-            time.sleep(delay)
+            if self.counter_reset_event.wait(delay):
+                self.counter_reset_event.clear()
+                log.info("Scheduler wake signal received; reevaluating current settings and limits")
 
 
 if __name__ == "__main__":
