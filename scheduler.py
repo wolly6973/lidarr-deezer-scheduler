@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 import requests
@@ -37,6 +38,9 @@ MANAGE_OTHER_INDEXERS = os.getenv("MANAGE_OTHER_INDEXERS", "true").lower() in {"
 OTHER_INDEXERS_EXCLUDE = {n.strip().lower() for n in os.getenv("OTHER_INDEXERS_EXCLUDE", "").split(",") if n.strip()}
 DB_PATH = os.getenv("DB_PATH", "/data/scheduler.db")
 TZ = os.getenv("TZ", "America/Chicago")
+SEARCH_WINDOW_ENABLED = os.getenv("SEARCH_WINDOW_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+SEARCH_WINDOW_START = os.getenv("SEARCH_WINDOW_START", "07:00")
+SEARCH_WINDOW_END = os.getenv("SEARCH_WINDOW_END", "23:00")
 
 # Ordering: "newest_artist" searches albums from the most recently added artists first.
 # "random" picks albums in random order.
@@ -848,6 +852,9 @@ class Scheduler:
 
     def run_once(self) -> int:
         """Run one small chunk and return how long to wait before the next chunk."""
+        window_wait = self.search_window_wait()
+        if window_wait is not None:
+            return window_wait
         try:
             self.refresh_lifetime_track_stats()
         except Exception:
@@ -945,10 +952,11 @@ class Scheduler:
             if MAX_DOWNLOADS_PER_DAY > 0 else "disabled",
         )
         log.info(
-            "Config: batch=%d daily searches=random %d-%d random chunk delay=%d-%ds cooldown=%sh idle retry=%ds manage_deezer_automatic_search=%s",
+            "Config: batch=%d daily searches=random %d-%d random chunk delay=%d-%ds cooldown=%sh idle retry=%ds search_window=%s %s-%s %s manage_deezer_automatic_search=%s",
             BATCH_SIZE, MIN_SEARCHES_PER_DAY, MAX_SEARCHES_PER_DAY,
             MIN_CHUNK_DELAY_SECONDS, MAX_CHUNK_DELAY_SECONDS,
             ALBUM_COOLDOWN_HOURS, IDLE_RETRY_SECONDS,
+            SEARCH_WINDOW_ENABLED, SEARCH_WINDOW_START, SEARCH_WINDOW_END, TZ,
             MANAGE_DEEZER_AUTOMATIC_SEARCH,
         )
 
