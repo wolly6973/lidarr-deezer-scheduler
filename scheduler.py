@@ -130,6 +130,24 @@ class Scheduler:
             );
             """
         )
+        # Backfill historical search batches from the existing per-album search log.
+        # This preserves a useful hit-rate baseline when upgrading an existing database.
+        historical = self.db.execute(
+            """SELECT command_id, MIN(searched_at) AS searched_at,
+                      COUNT(DISTINCT album_id) AS album_count, MAX(result) AS result
+               FROM search_events WHERE command_id IS NOT NULL GROUP BY command_id"""
+        ).fetchall()
+        for row in historical:
+            result = str(row["result"] or "")
+            if "reports downloaded" not in result.lower():
+                continue
+            self.db.execute(
+                """INSERT OR IGNORE INTO search_batches
+                   (command_id, searched_at, album_count, completed, downloads_found)
+                   VALUES (?, ?, ?, 1, ?)""",
+                (int(row["command_id"]), int(row["searched_at"]), int(row["album_count"]),
+                 self.parse_download_count(result)),
+            )
         self.db.commit()
 
     @staticmethod
