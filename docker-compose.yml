@@ -10,6 +10,9 @@ services:
       LIDARR_URL: "${LIDARR_URL:-}"
       LIDARR_API_KEY: "${LIDARR_API_KEY:-}"
       TZ: "${TZ:-America/Chicago}"
+      SEARCH_WINDOW_ENABLED: "${SEARCH_WINDOW_ENABLED:-true}"
+      SEARCH_WINDOW_START: "${SEARCH_WINDOW_START:-07:00}"
+      SEARCH_WINDOW_END: "${SEARCH_WINDOW_END:-23:00}"
 
       # Daily caps (a random value in each range is picked every local day)
       MIN_SEARCHES_PER_DAY: "${MIN_SEARCHES_PER_DAY:-}"
