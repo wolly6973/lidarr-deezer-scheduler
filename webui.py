@@ -65,7 +65,7 @@ def apply(values,persist=True):
    if lo and len(v)<lo: raise ValueError(label+" cannot be empty")
    if len(v)>hi: raise ValueError(label+" is too long")
   elif kind=="time":
-   if not isinstance(raw,str) or not re.fullmatch(r"(?:[01]\\d|2[0-3]):[0-5]\\d",raw):
+   if not isinstance(raw,str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d",raw):
     raise ValueError(label+" must use 24-hour HH:MM format")
    v=raw
   else:
