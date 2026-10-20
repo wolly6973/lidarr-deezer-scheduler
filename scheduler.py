@@ -530,8 +530,10 @@ class Scheduler:
         """Count imported track events for albums the scheduler has searched."""
         cursor = self.get_kv("lifetime_history_cursor")
         if cursor is None:
-            # Start counting from feature activation; don't misattribute older imports.
-            cursor = str(self.now() - 1)
+            # Backfill from the scheduler's earliest recorded search, not from the
+            # whole library's history, so old unrelated imports aren't counted.
+            row = self.db.execute("SELECT MIN(searched_at) AS first_search FROM search_events").fetchone()
+            cursor = str(int(row["first_search"]) - 1 if row["first_search"] is not None else self.now() - 1)
             self.set_kv("lifetime_history_cursor", cursor)
         since_ts = float(cursor)
         try:
@@ -552,9 +554,10 @@ class Scheduler:
                 album_id = int(album_value)
             except (TypeError, ValueError):
                 continue
-            if not self.db.execute(
-                "SELECT 1 FROM album_state WHERE album_id = ? LIMIT 1", (album_id,)
-            ).fetchone():
+            first_search = self.db.execute(
+                "SELECT MIN(searched_at) FROM search_events WHERE album_id = ?", (album_id,)
+            ).fetchone()[0]
+            if first_search is None or event_ts < float(first_search):
                 continue
             event_id = event.get("id")
             if event_id is None:
