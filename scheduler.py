@@ -569,9 +569,10 @@ class Scheduler:
                 "INSERT OR IGNORE INTO imported_track_events(event_id, imported_at, album_id) VALUES (?, ?, ?)",
                 (str(event_id), int(event_ts or self.now()), album_id),
             )
-        if events:
-            self.db.commit()
-            self.set_kv("lifetime_history_cursor", str(latest + 0.001))
+        # The history request succeeded, so advance the cursor even if there were no
+        # events; otherwise an idle scheduler would repeatedly query the same old range.
+        self.db.commit()
+        self.set_kv("lifetime_history_cursor", str(max(latest, float(self.now())) + 0.001))
 
     def lifetime_stats(self) -> dict[str, int | float]:
         searched = int(self.db.execute(
