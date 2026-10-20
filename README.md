@@ -16,7 +16,8 @@ Each cycle ("chunk") does the following:
 4. **Swaps indexers.** Turns **Automatic Search off** on every other indexer (the list is saved to the database first) and **on** for Deezer.
 5. **Searches.** Sends one `AlbumSearch` command for the batch and waits for it to finish.
 6. **Restores.** Turns Deezer off and re-enables exactly the indexers it disabled.
-7. **Sleeps** a random 15-45 minutes (configurable), then repeats.
+7. **Respects the search window.** New search chunks only start during the configured local-time window (default `07:00–23:00` in `America/Chicago`). Outside the window, the scheduler waits until it opens again. A batch already in progress is allowed to finish.
+8. **Sleeps** a random 15-45 minutes (configurable), then repeats.
 
 Only the Automatic Search toggle is changed. RSS and Interactive Search are left alone, so your normal RSS grabs and manual searches keep working.
 
@@ -100,6 +101,12 @@ Search history and state are stored in the `scheduler-data` volume (`/data/sched
 
 Settings are applied immediately and saved in `/data/webui-settings.json` with restrictive file permissions. The API key is never sent back to the browser after saving; leave its password field blank to keep the saved key. Keep the existing `scheduler-data` volume when redeploying.
 
+### Search window
+
+The Web UI lets you enable or disable the search window and set its start time, end time, and timezone. The window applies to starting new search chunks; the scheduler does not interrupt a batch that has already started. Both same-day windows (for example, `07:00–23:00`) and overnight windows (for example, `20:00–06:00`) are supported. If start and end times are identical, the setting is invalid; choose different times. Keep the timezone set to the region whose local hours you want to follow, such as `America/Chicago`.
+
+When the scheduler is outside the allowed window, logs report the configured window and the approximate time until it opens. If the window is disabled, this wait is skipped.
+
 ### Docker/Portainer deployment settings
 
 These are deployment-level settings, not scheduler settings:
@@ -128,6 +135,8 @@ Restored Automatic Search on 2 other indexer(s)
 ## Troubleshooting
 
 **Searches complete but nothing is grabbed.** Run an Interactive Search in Lidarr on one of the searched albums and hover over the rejection reasons. Common ones: the Deemix protocol is not enabled in a Delay Profile, a quality profile mismatch, or the album simply isn't on Deezer.
+
+**"Outside search window" in the log.** This is informational when the scheduler is outside the configured hours. It will wait until the next opening time; confirm the Web UI window, timezone, and current local time if that is unexpected.
 
 **"SAFETY PAUSE" in the log.** Open Lidarr > Activity > History and read the failure messages. A login or authentication message points to an expired Deezer ARL. After fixing the cause, clear the pause (it also tells the check to ignore failures from before now), then restart the container:
 
