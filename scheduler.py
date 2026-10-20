@@ -850,6 +850,55 @@ class Scheduler:
             )
         return 0
 
+    def search_window_wait(self) -> int | None:
+        """Return seconds until the next allowed window, or None if searching is allowed."""
+        if not SEARCH_WINDOW_ENABLED:
+            return None
+
+        try:
+            start_time = datetime.strptime(SEARCH_WINDOW_START, "%H:%M").time()
+            end_time = datetime.strptime(SEARCH_WINDOW_END, "%H:%M").time()
+            now = datetime.now(ZoneInfo(TZ))
+        except (ValueError, KeyError) as exc:
+            log.error("Invalid search window or timezone: %s", exc)
+            return IDLE_RETRY_SECONDS
+
+        if start_time == end_time:
+            log.error("Search window start and end cannot be identical")
+            return IDLE_RETRY_SECONDS
+
+        current_time = now.time()
+
+        if start_time < end_time:
+            # Same-day window, such as 07:00–23:00.
+            allowed = start_time <= current_time < end_time
+        else:
+            # Overnight window, such as 20:00–06:00.
+            allowed = current_time >= start_time or current_time < end_time
+
+        if allowed:
+            return None
+
+        next_start = now.replace(
+            hour=start_time.hour,
+            minute=start_time.minute,
+            second=0,
+            microsecond=0,
+        )
+        if current_time >= start_time:
+            next_start += timedelta(days=1)
+
+        wait = max(1, int((next_start - now).total_seconds()))
+        log.info(
+            "Outside search window (%s-%s %s); next search window opens in %dh %dm",
+            SEARCH_WINDOW_START,
+            SEARCH_WINDOW_END,
+            TZ,
+            wait // 3600,
+            (wait % 3600) // 60,
+        )
+        return wait
+
     def run_once(self) -> int:
         """Run one small chunk and return how long to wait before the next chunk."""
         window_wait = self.search_window_wait()
