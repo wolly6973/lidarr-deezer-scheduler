@@ -979,7 +979,7 @@ class Scheduler:
             log.info("Scheduler sleeping for %d seconds", delay)
             if self.counter_reset_event.wait(delay):
                 self.counter_reset_event.clear()
-                log.info("Daily cap counters were reset; resuming scheduler early")
+                log.info("Scheduler wake signal received; reevaluating current settings and limits")
 
 
 if __name__ == "__main__":
