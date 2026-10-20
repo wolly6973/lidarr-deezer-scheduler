@@ -114,6 +114,20 @@ class Scheduler:
                 ON search_events(searched_at);
             CREATE INDEX IF NOT EXISTS idx_search_events_album
                 ON search_events(album_id, searched_at);
+
+            CREATE TABLE IF NOT EXISTS search_batches (
+                command_id INTEGER PRIMARY KEY,
+                searched_at INTEGER NOT NULL,
+                album_count INTEGER NOT NULL,
+                completed INTEGER NOT NULL DEFAULT 0,
+                downloads_found INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS imported_track_events (
+                event_id TEXT PRIMARY KEY,
+                imported_at INTEGER NOT NULL,
+                album_id INTEGER
+            );
             """
         )
         self.db.commit()
@@ -494,6 +508,71 @@ class Scheduler:
         match = re.search(r"(\d+)\s+reports?\s+downloaded", result, re.IGNORECASE)
         return int(match.group(1)) if match else 0
 
+    def refresh_lifetime_track_stats(self) -> None:
+        """Count imported track events for albums the scheduler has searched."""
+        cursor = self.get_kv("lifetime_history_cursor")
+        if cursor is None:
+            # Start counting from feature activation; don't misattribute older imports.
+            cursor = str(self.now() - 1)
+            self.set_kv("lifetime_history_cursor", cursor)
+        since_ts = float(cursor)
+        try:
+            events = self.recent_history(since_ts)
+        except requests.RequestException as exc:
+            log.warning("Could not refresh lifetime imported-track count: %s", exc)
+            return
+
+        latest = since_ts
+        for event in events:
+            event_ts = self.parse_iso(event.get("date"))
+            latest = max(latest, event_ts)
+            if str(event.get("eventType", "")).lower() != "trackfileimported":
+                continue
+            data = event.get("data") or {}
+            album_value = data.get("albumId", event.get("albumId"))
+            try:
+                album_id = int(album_value)
+            except (TypeError, ValueError):
+                continue
+            if not self.db.execute(
+                "SELECT 1 FROM album_state WHERE album_id = ? LIMIT 1", (album_id,)
+            ).fetchone():
+                continue
+            event_id = event.get("id")
+            if event_id is None:
+                event_id = "|".join((
+                    str(event.get("date", "")), str(album_id),
+                    str(data.get("trackFileId", "")), str(data.get("path", "")),
+                ))
+            self.db.execute(
+                "INSERT OR IGNORE INTO imported_track_events(event_id, imported_at, album_id) VALUES (?, ?, ?)",
+                (str(event_id), int(event_ts or self.now()), album_id),
+            )
+        if events:
+            self.db.commit()
+            self.set_kv("lifetime_history_cursor", str(latest + 0.001))
+
+    def lifetime_stats(self) -> dict[str, int | float]:
+        searched = int(self.db.execute(
+            "SELECT COUNT(DISTINCT album_id) FROM search_events"
+        ).fetchone()[0])
+        batches = self.db.execute(
+            "SELECT COUNT(*) AS total, SUM(CASE WHEN downloads_found > 0 THEN 1 ELSE 0 END) AS hits "
+            "FROM search_batches WHERE completed = 1"
+        ).fetchone()
+        total_batches = int(batches["total"] or 0)
+        hit_batches = int(batches["hits"] or 0)
+        tracks = int(self.db.execute(
+            "SELECT COUNT(*) FROM imported_track_events"
+        ).fetchone()[0])
+        return {
+            "lifetime_albums_searched": searched,
+            "lifetime_completed_batches": total_batches,
+            "lifetime_hit_batches": hit_batches,
+            "lifetime_hit_rate": round(hit_batches * 100.0 / total_batches, 1) if total_batches else 0.0,
+            "lifetime_tracks_downloaded": tracks,
+        }
+
     def run_search(self, album_ids: list[int]) -> tuple[bool, int]:
         payload = {"name": "AlbumSearch", "albumIds": album_ids}
 
@@ -505,6 +584,11 @@ class Scheduler:
             data = self.post_json("command", payload)
             command_id = int(data["id"])
             self.record_search_start(album_ids, command_id)
+            self.db.execute(
+                "INSERT OR REPLACE INTO search_batches(command_id, searched_at, album_count, completed, downloads_found) VALUES (?, ?, ?, 0, 0)",
+                (command_id, self.now(), len(album_ids)),
+            )
+            self.db.commit()
 
             log.info("Started Lidarr AlbumSearch command %s for %d album(s): %s", command_id, len(album_ids), album_ids)
 
@@ -531,6 +615,11 @@ class Scheduler:
             result = str(result)
             download_count = self.parse_download_count(result) if success else 0
             self.record_search_result(album_ids, command_id, result, success)
+            self.db.execute(
+                "UPDATE search_batches SET completed = ?, downloads_found = ? WHERE command_id = ?",
+                (int(success), self.parse_download_count(result) if success else 0, command_id),
+            )
+            self.db.commit()
 
             if success:
                 log.info("Completed AlbumSearch command %s: %s | downloads initiated: %d", command_id, result, download_count)
@@ -737,6 +826,10 @@ class Scheduler:
 
     def run_once(self) -> int:
         """Run one small chunk and return how long to wait before the next chunk."""
+        try:
+            self.refresh_lifetime_track_stats()
+        except Exception:
+            log.exception("Could not update lifetime statistics")
         pause = self.safety_check()
         if pause > 0:
             return pause
